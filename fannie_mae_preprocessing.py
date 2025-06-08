@@ -1,5 +1,5 @@
 import polars as pl
-
+import os 
 column_names = [  # Full list not needed since we're selecting subset
     "POOL_ID", "LOAN_ID", "ACT_PERIOD", "CHANNEL", "SELLER", "SERVICER",
     "MASTER_SERVICER", "ORIG_RATE", "CURR_RATE", "ORIG_UPB", "ISSUANCE_UPB",
@@ -92,6 +92,14 @@ dtype_spec = {
     "MATR_DT": pl.Utf8,
 }
 
+def convert_myyyy(val):
+    try:
+        val = int(val)
+        month = val // 10000
+        year = val % 10000
+        return f"{year}-{month:02d}-01"
+    except Exception:
+        return None
 
 
 quarters = [f"{year}Q{q}" for year in range(2017, 2023) for q in (1, 3)]
