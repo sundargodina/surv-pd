@@ -250,7 +250,7 @@ for year in range(2017, 2023):
             print(f"  File not found: {parquet_path}")
             continue
 
-        print(f"\n📊 Processing {quarter}...")
+        print(f"\nProcessing {quarter}...")
 
         try:
             # Load data
