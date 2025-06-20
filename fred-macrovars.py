@@ -66,4 +66,8 @@ def fetch_and_save_all_macro():
 fetch_and_save_all_macro()
     
 
-
+#code to join the data, left join
+survivaL_data = pl.read_parquet('/Users/sme/Downloads/survival_files/survival_all.parquet')
+macro_data = pl.read_csv('/Users/sme/Downloads/fred/macro_pca_features.csv')
+merged_df = survivaL_data.join(macro_data, on='quarter', how='left')
+merged_df.write_parquet('/Users/sme/Downloads/fred/merged.parquet')
