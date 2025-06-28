@@ -1,1 +1,519 @@
+import pandas as pd
+import numpy as np
+from lifelines import CoxPHFitter
+from lifelines.utils import concordance_index
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
+class SurvivalAnalysisProcessor:
+    """
+    Complete survival analysis processor for IFRS 9 PD estimation
+    Implements Cox Proportional Hazards model and extracts features for ML
+    Works with unsplit data - handles splitting internally or processes entire dataset
+    """
+    
+    def __init__(self, lifetime_horizon=60):
+        """
+        Initialize the survival analysis processor
+        
+        Parameters:
+        lifetime_horizon (int): Maximum time horizon for lifetime PD (e.g., 60 months)
+        """
+        self.lifetime_horizon = lifetime_horizon
+        self.cph = CoxPHFitter()
+        self.is_fitted = False
+        self.feature_names = []
+        
+    def fit_cox_model(self, data_df, duration_col='time', event_col='default', 
+                     feature_cols=None, penalizer=0.0, use_full_data=True, 
+                     test_size=0.2, random_state=42):
+        """
+        Fit Cox Proportional Hazards model
+        
+        Parameters:
+        data_df (DataFrame): Complete dataset
+        duration_col (str): Column name for time to event
+        event_col (str): Column name for event indicator (1=default, 0=censored)
+        feature_cols (list): List of feature columns to include. If None, uses all except duration and event
+        penalizer (float): L2 penalty for regularization
+        use_full_data (bool): If True, use entire dataset for fitting. If False, split for validation
+        test_size (float): Proportion of data to use for testing (only used if use_full_data=False)
+        random_state (int): Random state for reproducible splits
+        """
+        
+        print("=" * 60)
+        print("FITTING COX PROPORTIONAL HAZARDS MODEL")
+        print("=" * 60)
+        
+        # Prepare data for Cox model
+        if feature_cols is None:
+            # Use all columns except duration and event
+            feature_cols = [col for col in data_df.columns 
+                           if col not in [duration_col, event_col]]
+        
+        self.feature_names = feature_cols
+        
+        # Determine training data
+        if use_full_data:
+            print("Using entire dataset for model fitting...")
+            train_data = data_df[[duration_col, event_col] + feature_cols].copy()
+            self.train_indices = data_df.index
+            self.test_indices = None
+        else:
+            print(f"Splitting data: {1-test_size:.0%} train, {test_size:.0%} test...")
+            # Split the data
+            train_idx, test_idx = train_test_split(
+                data_df.index, 
+                test_size=test_size, 
+                random_state=random_state,
+                stratify=data_df[event_col]  # Stratify by event to maintain event rate
+            )
+            train_data = data_df.loc[train_idx, [duration_col, event_col] + feature_cols].copy()
+            self.train_indices = train_idx
+            self.test_indices = test_idx
+            
+            print(f"Training set: {len(train_idx):,} observations")
+            print(f"Test set: {len(test_idx):,} observations")
+        
+        # Check for missing values
+        if train_data.isnull().any().any():
+            print("Warning: Missing values detected. Consider handling them before fitting.")
+            print("Missing values per column:")
+            print(train_data.isnull().sum()[train_data.isnull().sum() > 0])
+        
+        # Fit Cox model
+        try:
+            self.cph.fit(train_data, 
+                        duration_col=duration_col, 
+                        event_col=event_col,
+                        robust=True
+                        )
+            self.is_fitted = True
+            
+            print(f"✓ Cox model fitted successfully")
+            print(f"✓ Concordance Index: {self.cph.concordance_index_:.4f}")
+            print(f"✓ Number of observations: {len(train_data):,}")
+            print(f"✓ Number of events: {train_data[event_col].sum():,}")
+            print(f"✓ Event rate: {train_data[event_col].mean():.3%}")
+            
+            # If we have a test set, calculate test concordance
+            if not use_full_data and self.test_indices is not None:
+                test_data = data_df.loc[self.test_indices, [duration_col, event_col] + feature_cols]
+                test_predictions = self.cph.predict_log_partial_hazard(test_data[feature_cols])
+                test_concordance = concordance_index(
+                    test_data[duration_col], 
+                    -test_predictions, 
+                    test_data[event_col]
+                )
+                print(f"✓ Test Concordance Index: {test_concordance:.4f}")
+            
+        except Exception as e:
+            print(f"Error fitting Cox model: {str(e)}")
+            raise
+            
+        return self
+    
+    def extract_survival_features(self, data_df, duration_col='time', event_col='default'):
+        """
+        Extract survival analysis features from fitted Cox model for entire dataset
+        
+        Parameters:
+        data_df (DataFrame): Complete dataset to extract features from
+        duration_col (str): Column name for time to event
+        event_col (str): Column name for event indicator
+        
+        Returns:
+        DataFrame: Original dataframe with added survival features
+        """
+        
+        if not self.is_fitted:
+            raise ValueError("Cox model must be fitted first. Call fit_cox_model().")
+        
+        print("\n" + "=" * 60)
+        print("EXTRACTING SURVIVAL FEATURES FOR ENTIRE DATASET")
+        print("=" * 60)
+        
+        # Create a copy to avoid modifying original data
+        result_df = data_df.copy()
+        
+        # Prepare data for prediction (same features used in training)
+        prediction_data = data_df[self.feature_names].copy()
+        
+        try:
+            # 1. Hazard Scores (η_i = β^T X_i)
+            print("Computing hazard scores...")
+            result_df['hazard_score'] = self.cph.predict_log_partial_hazard(prediction_data)
+            
+            # 2. Survival Probabilities for different time horizons
+            print("Computing survival probabilities...")
+            
+            # 12-month survival (IFRS 9 Stage 1)
+            survival_12m = self.cph.predict_survival_function(prediction_data, times=[12])
+            result_df['surv_12m'] = survival_12m.iloc[:, 0].values
+            
+            # Lifetime survival (IFRS 9 Stage 2/3)
+            survival_lifetime = self.cph.predict_survival_function(prediction_data, 
+                                                                 times=[self.lifetime_horizon])
+            result_df['surv_lifetime'] = survival_lifetime.iloc[:, 0].values
+            
+            # Additional time points for granular analysis
+            survival_24m = self.cph.predict_survival_function(prediction_data, times=[24])
+            result_df['surv_24m'] = survival_24m.iloc[:, 0].values
+            
+            survival_36m = self.cph.predict_survival_function(prediction_data, times=[36])
+            result_df['surv_36m'] = survival_36m.iloc[:, 0].values
+            
+            # 3. Probability of Default (PD) calculations
+            print("Computing PD estimates...")
+            result_df['PD_12m'] = 1 - result_df['surv_12m']
+            result_df['PD_24m'] = 1 - result_df['surv_24m']
+            result_df['PD_36m'] = 1 - result_df['surv_36m']
+            result_df['PD_lifetime'] = 1 - result_df['surv_lifetime']
+            
+            # 4. Cumulative Hazards
+            print("Computing cumulative hazards...")
+            cum_hazard_12m = self.cph.predict_cumulative_hazard(prediction_data, times=[12])
+            result_df['cum_hazard_12m'] = cum_hazard_12m.iloc[:, 0].values
+            
+            cum_hazard_lifetime = self.cph.predict_cumulative_hazard(prediction_data, 
+                                                                   times=[self.lifetime_horizon])
+            result_df['cum_hazard_lifetime'] = cum_hazard_lifetime.iloc[:, 0].values
+            
+            # 5. IFRS 9 Stage Classification (simplified logic - customize as needed)
+            print("Assigning IFRS 9 stages...")
+            result_df['ifrs9_stage'] = self._classify_ifrs9_stages(result_df)
+            
+            # 6. Mark train/test split if applicable
+            if hasattr(self, 'train_indices') and hasattr(self, 'test_indices'):
+                if self.test_indices is not None:
+                    result_df['data_split'] = 'test'
+                    result_df.loc[self.train_indices, 'data_split'] = 'train'
+                else:
+                    result_df['data_split'] = 'full_data'
+            else:
+                result_df['data_split'] = 'full_data'
+            
+            # 7. Quality checks and adjustments
+            print("Performing quality checks...")
+            result_df = self._quality_checks_and_adjustments(result_df)
+            
+            print("✓ Survival features extracted successfully")
+            self._print_feature_summary(result_df)
+            
+        except Exception as e:
+            print(f"Error extracting survival features: {str(e)}")
+            raise
+            
+        return result_df
+    
+    def _classify_ifrs9_stages(self, df):
+        """
+        Classify loans into IFRS 9 stages based on PD
+        Customize these thresholds based on your institution's criteria
+        """
+        def assign_stage(pd_12m):
+            if pd_12m <= 0.005:  # 0.5% threshold for Stage 1
+                return 1
+            elif pd_12m <= 0.20:  # 20% threshold for Stage 2
+                return 2
+            else:
+                return 3  # Stage 3 (credit-impaired)
+        
+        return df['PD_12m'].apply(assign_stage)
+    
+    def _quality_checks_and_adjustments(self, df):
+        """
+        Perform quality checks and adjustments for IFRS 9 compliance
+        """
+        # Check 1: Ensure 12m PD <= Lifetime PD
+        inconsistent_mask = df['PD_12m'] > df['PD_lifetime']
+        if inconsistent_mask.any():
+            n_inconsistent = inconsistent_mask.sum()
+            print(f"⚠️  Warning: {n_inconsistent:,} observations have PD_12m > PD_lifetime")
+            print("   Adjusting lifetime PD to equal 12m PD for consistency...")
+            df.loc[inconsistent_mask, 'PD_lifetime'] = df.loc[inconsistent_mask, 'PD_12m']
+            df.loc[inconsistent_mask, 'surv_lifetime'] = df.loc[inconsistent_mask, 'surv_12m']
+        
+        # Check 2: Ensure monotonic PD progression
+        df['PD_12m'] = np.clip(df['PD_12m'], 0, 1)
+        df['PD_24m'] = np.clip(df['PD_24m'], df['PD_12m'], 1)
+        df['PD_36m'] = np.clip(df['PD_36m'], df['PD_24m'], 1)
+        df['PD_lifetime'] = np.clip(df['PD_lifetime'], df['PD_36m'], 1)
+        
+        # Update corresponding survival probabilities
+        df['surv_12m'] = 1 - df['PD_12m']
+        df['surv_24m'] = 1 - df['PD_24m']
+        df['surv_36m'] = 1 - df['PD_36m']
+        df['surv_lifetime'] = 1 - df['PD_lifetime']
+        
+        return df
+    
+    def _print_feature_summary(self, df):
+        """Print summary statistics of extracted features"""
+        print("\n" + "-" * 40)
+        print("SURVIVAL FEATURES SUMMARY")
+        print("-" * 40)
+        
+        survival_features = ['hazard_score', 'PD_12m', 'PD_24m', 'PD_36m', 'PD_lifetime']
+        
+        for feature in survival_features:
+            if feature in df.columns:
+                print(f"{feature:15}: Mean={df[feature].mean():.4f}, "
+                      f"Std={df[feature].std():.4f}, "
+                      f"Min={df[feature].min():.4f}, "
+                      f"Max={df[feature].max():.4f}")
+        
+        print(f"\nIFRS 9 Stage Distribution:")
+        if 'ifrs9_stage' in df.columns:
+            stage_counts = df['ifrs9_stage'].value_counts().sort_index()
+            for stage, count in stage_counts.items():
+                pct = count / len(df) * 100
+                print(f"  Stage {stage}: {count:,} ({pct:.1f}%)")
+        
+        # Print data split information if available
+        if 'data_split' in df.columns:
+            print(f"\nData Split Distribution:")
+            split_counts = df['data_split'].value_counts()
+            for split, count in split_counts.items():
+                pct = count / len(df) * 100
+                print(f"  {split}: {count:,} ({pct:.1f}%)")
+    
+    def get_ml_features(self, df, include_split_info=True):
+        """
+        Get features suitable for machine learning models
+        
+        Parameters:
+        df (DataFrame): Processed dataframe with survival features
+        include_split_info (bool): Whether to include data split information
+        
+        Returns:
+        DataFrame: Features for ML models (Cox outputs + original features)
+        """
+        # Cox-derived features
+        cox_features = [
+            'hazard_score', 'surv_12m', 'surv_24m', 'surv_36m', 'surv_lifetime',
+            'PD_12m', 'PD_24m', 'PD_36m', 'PD_lifetime',
+            'cum_hazard_12m', 'cum_hazard_lifetime', 'ifrs9_stage'
+        ]
+        
+        # Original features used in Cox model
+        original_features = self.feature_names
+        
+        # Combine all features
+        all_features = cox_features + original_features
+        
+        # Add split information if requested and available
+        if include_split_info and 'data_split' in df.columns:
+            all_features.append('data_split')
+        
+        available_features = [f for f in all_features if f in df.columns]
+        
+        return df[available_features].copy()
+    
+    def get_train_test_split(self, df):
+        """
+        Get separate train and test dataframes if split was performed
+        
+        Parameters:
+        df (DataFrame): Processed dataframe with survival features
+        
+        Returns:
+        tuple: (train_df, test_df) or (None, None) if no split was performed
+        """
+        if 'data_split' in df.columns and 'train' in df['data_split'].values:
+            train_df = df[df['data_split'] == 'train'].copy()
+            test_df = df[df['data_split'] == 'test'].copy()
+            return train_df, test_df
+        else:
+            return None, None
+    
+    def plot_diagnostics(self, processed_df, duration_col='time', event_col='default'):
+        """
+        Plot diagnostic plots for Cox model
+        """
+        if not self.is_fitted:
+            raise ValueError("Cox model must be fitted first.")
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. Survival curves by IFRS 9 stage
+        if 'ifrs9_stage' in processed_df.columns:
+            ax = axes[0, 0]
+            for stage in sorted(processed_df['ifrs9_stage'].unique()):
+                stage_data = processed_df[processed_df['ifrs9_stage'] == stage]
+                if len(stage_data) > 0:
+                    # Use a representative sample for plotting if dataset is large
+                    sample_size = min(1, len(stage_data))
+                    sample_data = stage_data.sample(n=sample_size, random_state=42)
+                    surv_func = self.cph.predict_survival_function(
+                        sample_data[self.feature_names].iloc[:1]
+                    )
+                    ax.plot(surv_func.index, surv_func.iloc[:, 0], 
+                           label=f'Stage {stage}', linewidth=2)
+            ax.set_title('Survival Curves by IFRS 9 Stage')
+            ax.set_xlabel('Time (months)')
+            ax.set_ylabel('Survival Probability')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # 2. Hazard score distribution
+        ax = axes[0, 1]
+        processed_df['hazard_score'].hist(bins=50, ax=ax, alpha=0.7)
+        ax.set_title('Distribution of Hazard Scores')
+        ax.set_xlabel('Hazard Score')
+        ax.set_ylabel('Frequency')
+        ax.grid(True, alpha=0.3)
+        
+        # 3. PD comparison
+        ax = axes[1, 0]
+        pd_columns = ['PD_12m', 'PD_24m', 'PD_36m', 'PD_lifetime']
+        pd_data = processed_df[pd_columns].mean()
+        pd_data.plot(kind='bar', ax=ax)
+        ax.set_title('Average PD by Time Horizon')
+        ax.set_xlabel('Time Horizon')
+        ax.set_ylabel('Average PD')
+        ax.tick_params(axis='x', rotation=45)
+        ax.grid(True, alpha=0.3)
+        
+        # 4. Cox model coefficients
+        ax = axes[1, 1]
+        coef_df = pd.DataFrame({
+            'Feature': self.cph.params_.index,
+            'Coefficient': self.cph.params_.values,
+            'P_value': self.cph.summary['p'].values
+        })
+        
+        # Plot top 10 coefficients by absolute value
+        top_coef = coef_df.reindex(coef_df['Coefficient'].abs().sort_values(ascending=False).index).head(10)
+        bars = ax.barh(range(len(top_coef)), top_coef['Coefficient'])
+        ax.set_yticks(range(len(top_coef)))
+        ax.set_yticklabels(top_coef['Feature'])
+        ax.set_title('Top 10 Cox Model Coefficients')
+        ax.set_xlabel('Coefficient Value')
+        ax.grid(True, alpha=0.3)
+        
+        # Color bars based on significance
+        for i, p_val in enumerate(top_coef['P_value']):
+            if p_val < 0.05:
+                bars[i].set_color('darkred')
+            else:
+                bars[i].set_color('lightcoral')
+        
+        plt.tight_layout()
+        plt.show()
+
+# Main Processing Function for Unsplit Data
+def process_survival_data(data_df, duration_col='time', event_col='default', 
+                         feature_cols=None, lifetime_horizon=60, use_full_data=True,
+                         test_size=0.2, random_state=42):
+    """
+    Complete survival analysis processing pipeline for unsplit data
+    
+    Parameters:
+    data_df (DataFrame): Complete dataset
+    duration_col (str): Column name for time to event
+    event_col (str): Column name for event indicator
+    feature_cols (list): List of feature columns to include
+    lifetime_horizon (int): Maximum time horizon for lifetime PD
+    use_full_data (bool): If True, use entire dataset for fitting. If False, split for validation
+    test_size (float): Proportion of data to use for testing (only used if use_full_data=False)
+    random_state (int): Random state for reproducible splits
+    
+    Returns:
+    tuple: (processed_df, survival_processor) or (processed_df, train_df, test_df, survival_processor)
+    """
+    
+    print("STARTING COMPLETE SURVIVAL ANALYSIS PIPELINE")
+    print("=" * 80)
+    print(f"Dataset shape: {data_df.shape}")
+    print(f"Using full data for training: {use_full_data}")
+    
+    # Initialize processor
+    processor = SurvivalAnalysisProcessor(lifetime_horizon=lifetime_horizon)
+    
+    # Fit Cox model
+    processor.fit_cox_model(data_df, 
+                           duration_col=duration_col, 
+                           event_col=event_col,
+                           feature_cols=feature_cols,
+                           use_full_data=use_full_data,
+                           test_size=test_size,
+                           random_state=random_state)
+    
+    # Extract features for entire dataset
+    print("\nProcessing entire dataset...")
+    processed_df = processor.extract_survival_features(data_df, 
+                                                      duration_col=duration_col,
+                                                      event_col=event_col)
+    
+    # Generate diagnostic plots
+    print("\nGenerating diagnostic plots...")
+    processor.plot_diagnostics(processed_df, duration_col, event_col)
+    
+    print("\n" + "=" * 80)
+    print("SURVIVAL ANALYSIS PIPELINE COMPLETED SUCCESSFULLY!")
+    print("=" * 80)
+    
+    # Return results based on whether split was performed
+    if use_full_data:
+        return processed_df, processor
+    else:
+        train_df, test_df = processor.get_train_test_split(processed_df)
+        return processed_df, train_df, test_df, processor
+
+def preprocess_features(df, categorical_cols, drop_cols=None):
+    df = df.copy()
+    
+    # Drop non-informative or date columns
+    if drop_cols is None:
+        drop_cols = ['LOAN_ID', 'ORIG_DATE', 'FORECLOSURE_DATE', 'MATR_DT', 'date']
+    df.drop(columns=[col for col in drop_cols if col in df.columns], inplace=True)
+    
+    # Identify categorical features to encode
+    encode_cols = [col for col in categorical_cols if col in df.columns and col not in drop_cols]
+    
+    # One-hot encode
+    df = pd.get_dummies(df, columns=encode_cols, drop_first=True)
+    
+    return df
+
+# Convenience function for getting ML-ready features
+def get_ml_ready_data(processed_df, processor, separate_train_test=False):
+    """
+    Get ML-ready features from processed survival data
+    
+    Parameters:
+    processed_df (DataFrame): Processed dataframe with survival features
+    processor (SurvivalAnalysisProcessor): Fitted survival processor
+    separate_train_test (bool): Whether to return separate train/test datasets
+    
+    Returns:
+    DataFrame or tuple: ML-ready features
+    """
+    ml_features = processor.get_ml_features(processed_df)
+    
+    if separate_train_test and 'data_split' in processed_df.columns:
+        if 'train' in processed_df['data_split'].values:
+            train_ml = ml_features[ml_features['data_split'] == 'train'].drop('data_split', axis=1)
+            test_ml = ml_features[ml_features['data_split'] == 'test'].drop('data_split', axis=1)
+            return train_ml, test_ml
+        else:
+            print("No train/test split found in data. Returning full dataset.")
+            return ml_features.drop('data_split', axis=1, errors='ignore')
+    else:
+        return ml_features.drop('data_split', axis=1, errors='ignore')
+
+
+# Load your complete dataset
+data_df = pd.read_parquet('/Users/sundargodina/Downloads/fred/merged.parquet')
+
+categorical_cols = [
+    'LOAN_ID', 'DLQ_STATUS', 'ORIG_DATE', 'PURPOSE', 'STATE', 
+    'PROP', 'OCC_STAT', 'FORECLOSURE_DATE', 'Zero_Bal_Code', 
+    'MATR_DT', 'final_dlq_status', 'ifrs9_stage', 'quarter', 'date'
+]
+
 
