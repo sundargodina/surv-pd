@@ -8,8 +8,8 @@ from sklearn.impute import SimpleImputer
 import warnings
 warnings.filterwarnings('ignore')
 
-FRED_API_KEY = 'e6afe32a2806088e5d190997847b1665'
-START_DATE = '2016-01-01'
+FRED_API_KEY = 'putyourkeyhere'
+START_DATE = '2012-01-01'
 END_DATE = '2023-12-31'
 RAW_MACRO_FILE = '/Users/sundargodina/Downloads/fred/raw_macro_data.csv'
 
@@ -48,9 +48,8 @@ def fetch_macro_data():
     if all_data.empty:
         raise ValueError("No macro data could be fetched!")
     
-    # Convert to quarterly and keep only Q1 and Q3
+    # Convert to quarterly (standard quarterly end dates)
     quarterly_data = all_data.resample('Q').last()
-    quarterly_data = quarterly_data[quarterly_data.index.quarter.isin([1, 3])]
     
     # Save raw data
     quarterly_data.to_csv(RAW_MACRO_FILE)
@@ -332,7 +331,7 @@ class MacroSurvivalProcessor:
         return clean_df
     
     def map_to_quarter(self, date):
-        """Map date to Q1 or Q3"""
+        """Map date to standard quarter end - MODIFIED FOR STANDARD QUARTERLY MAPPING"""
         if pd.isna(date):
             return None
         
@@ -340,10 +339,15 @@ class MacroSurvivalProcessor:
         year = dt.year
         quarter = dt.quarter
         
-        if quarter in [1, 2]:
+        # Standard quarterly mapping - map to actual quarter end
+        if quarter == 1:
             return pd.Timestamp(f'{year}-03-31')
-        else:
+        elif quarter == 2:
+            return pd.Timestamp(f'{year}-06-30')
+        elif quarter == 3:
             return pd.Timestamp(f'{year}-09-30')
+        else:  # quarter == 4
+            return pd.Timestamp(f'{year}-12-31')
     
     def _fix_data_types_for_parquet(self, df):
         """Fix data types before saving to Parquet"""
@@ -405,7 +409,7 @@ class MacroSurvivalProcessor:
         else:
             original_quarter = None
 
-        # Map origination dates to macro quarters
+        # Map origination dates to macro quarters using standard quarterly mapping
         survival_df['macro_quarter'] = survival_df['ORIG_DATE'].apply(self.map_to_quarter)
 
         # Merge with macro data
