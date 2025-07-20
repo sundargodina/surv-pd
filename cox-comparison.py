@@ -2,642 +2,482 @@ import pandas as pd
 import numpy as np
 from lifelines import CoxPHFitter
 from lifelines.utils import concordance_index
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
 import gc
+import psutil
 import warnings
 warnings.filterwarnings('ignore')
 
-# MEMORY OPTIMIZATION SETTINGS
-pd.set_option('mode.copy_on_write', True)
+# Memory management settings for Mac Air i3
+pd.set_option('mode.copy_on_write', True)  # Reduce memory usage
+CHUNK_SIZE = 50000  # Process in chunks
+MAX_MEMORY_PCT = 0.7  # Use max 70% of available RAM
 
-# STEP 1: Memory-Efficient Data Loading with Stratified Sampling
-def load_and_stratified_sample(file_path, sample_size=800000, random_state=42):
-    """
-    Load parquet data with stratified sampling to preserve performance
-    Key insight: Stratified sampling by default event maintains model performance better
-    """
-    print("Loading parquet data with stratified sampling for better performance...")
+def get_memory_usage():
+    """Get current memory usage"""
+    process = psutil.Process()
+    return process.memory_info().rss / 1024 / 1024  # MB
+
+def optimize_dtypes(df):
+    """Optimize data types to reduce memory usage"""
+    print("Optimizing data types...")
+    original_memory = df.memory_usage(deep=True).sum() / 1024**2
     
-    # Read parquet file efficiently
-    print("Reading parquet file...")
-    df = pd.read_parquet(file_path)
-    
-    print(f"Original dataset size: {len(df):,} rows")
-    
-    # Apply stratified sampling if dataset is large
-    if len(df) > sample_size:
-        print(f"Applying stratified sampling to {sample_size:,} rows...")
+    for col in df.columns:
+        col_type = df[col].dtype
         
-        # Stratified sampling by default_event to preserve event distribution
-        if 'default_event' in df.columns:
-            # Sample separately for events and non-events
-            events = df[df['default_event'] == 1]
-            non_events = df[df['default_event'] == 0]
+        if col_type != 'object' and col_type.name != 'category':
+            c_min = df[col].min()
+            c_max = df[col].max()
             
-            # Calculate proportional sample sizes
-            event_ratio = len(events) / len(df)
-            event_sample_size = int(sample_size * event_ratio)
-            non_event_sample_size = sample_size - event_sample_size
-            
-            # Sample from each group
-            event_sample = events.sample(n=min(event_sample_size, len(events)), 
-                                       random_state=random_state) if len(events) > 0 else pd.DataFrame()
-            non_event_sample = non_events.sample(n=min(non_event_sample_size, len(non_events)), 
-                                               random_state=random_state) if len(non_events) > 0 else pd.DataFrame()
-            
-            df = pd.concat([event_sample, non_event_sample], ignore_index=True)
-            
-            # Clean up
-            del events, non_events, event_sample, non_event_sample
-        else:
-            # Fallback to simple sampling if default_event not available
-            df = df.sample(n=sample_size, random_state=random_state)
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                    
+            elif str(col_type)[:5] == 'float':
+                if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
     
-    # FIXED: Parse quarter column properly
-    if 'quarter' in df.columns:
-        # Extract year and quarter from '2017Q1' format
-        df['orig_year'] = df['quarter'].str[:4].astype('int16')
-        df['quarter_num'] = df['quarter'].str[-1].astype('int8')
-        # Keep original quarter for time-based splitting
-        df['quarter_year'] = df['quarter'].astype('category')
+    # Convert categorical string columns
+    for col in df.select_dtypes(include=['object']):
+        num_unique_values = len(df[col].unique())
+        num_total_values = len(df[col])
+        if num_unique_values / num_total_values < 0.5:
+            df[col] = df[col].astype('category')
     
-    # Optimize data types for memory efficiency
-    dtype_dict = {
-        'LOAN_AGE': 'int16',
-        'CSCORE_B': 'int16', 
-        'DTI': 'float32',
-        'ORIG_RATE': 'float32',
-        'ORIG_UPB': 'float32',
-        'ORIG_TERM': 'int16',
-        'OLTV': 'float32',
-        'NUM_BO': 'int8',
-        'FIRST_FLAG': 'category',
-        'PURPOSE': 'category',
-        'PROP': 'category',
-        'OCC_STAT': 'category',
-        'CHANNEL': 'category',
-        'STATE': 'category',
-        'default_event': 'int8',
-        'survival_time': 'float32',
-        'quarter_num': 'int8',
-        'orig_year': 'int16',
-        'credit_score_bucket': 'category',
-        'dti_bucket': 'category',
-        'ltv_bucket': 'category',
-        # Macro economic features
-        'interest_rates_PC1': 'float32',
-        'credit_spreads_PC1': 'float32',
-        'housing_PC1': 'float32',
-        'labor_market_PC1': 'float32',
-        'financial_stress_PC1': 'float32',
-        'economic_activity_PC2': 'float32',
-        'inflation_PC1': 'float32',
-        'markets_sentiment_PC2': 'float32'
-    }
+    new_memory = df.memory_usage(deep=True).sum() / 1024**2
+    print(f"Memory usage reduced from {original_memory:.1f}MB to {new_memory:.1f}MB ({100*(original_memory-new_memory)/original_memory:.1f}% reduction)")
     
-    # Apply optimized dtypes where columns exist
-    for col, dtype in dtype_dict.items():
-        if col in df.columns:
-            try:
-                df[col] = df[col].astype(dtype)
-            except:
-                print(f"Warning: Could not convert {col} to {dtype}")
-    
-    gc.collect()
-    
-    print(f"Loaded {len(df):,} loans with stratified sampling")
-    if 'default_event' in df.columns:
-        print(f"Default rate preserved: {df['default_event'].mean():.4f}")
     return df
 
-# STEP 2: Curated Feature Selection (Removing Data Leakage & Useless Features)
-core_features = [
-    'CSCORE_B', 'DTI', 'ORIG_RATE', 'ORIG_UPB', 'ORIG_TERM', 'OLTV', 
-    'NUM_BO', 'FIRST_FLAG', 'PURPOSE', 'PROP', 'OCC_STAT', 'CHANNEL', 
-    'STATE', 'credit_score_bucket', 'dti_bucket', 'ltv_bucket'
-]
-
-macro_features = [
-    'interest_rates_PC1', 'credit_spreads_PC1', 'housing_PC1',
-    'labor_market_PC1', 'financial_stress_PC1', 'economic_activity_PC2',
-    'inflation_PC1', 'markets_sentiment_PC2'
-]
-
-duration_col = 'survival_time'
-event_col = 'default_event'
-
-# STEP 3: Enhanced Train/Test Split with Time-Based Validation
-def enhanced_time_split(df):
-    """Enhanced time-based split with Q1 and Q3 data only from 2017-2022"""
-    if 'quarter_year' not in df.columns:
-        df['quarter_year'] = df['quarter'].astype(str) if 'quarter' in df.columns else 'Unknown'
-    
-    train_quarters = ['2017Q1', '2017Q3', '2018Q1', '2018Q3', '2019Q1', '2019Q3', '2020Q1']
-    val_quarters = ['2020Q3', '2021Q1']
-    test_quarters = ['2021Q3', '2022Q1', '2022Q3']
-    
-    train_mask = df['quarter_year'].isin(train_quarters)
-    val_mask = df['quarter_year'].isin(val_quarters)
-    test_mask = df['quarter_year'].isin(test_quarters)
-    
-    print(f"Train quarters: {train_quarters}")
-    print(f"Val quarters: {val_quarters}")
-    print(f"Test quarters: {test_quarters}")
-    print(f"Available quarters in data: {sorted(df['quarter_year'].unique())}")
-    
-    # Create datasets for both models
-    core_cols = [col for col in core_features if col in df.columns] + [duration_col, event_col]
-    macro_cols = [col for col in core_features + macro_features if col in df.columns] + [duration_col, event_col]
-    
-    # Core model data
-    train_core = df[train_mask][core_cols].copy()
-    val_core = df[val_mask][core_cols].copy()
-    test_core = df[test_mask][core_cols].copy()
-    
-    # Macro model data  
-    train_macro = df[train_mask][macro_cols].copy()
-    val_macro = df[val_mask][macro_cols].copy()
-    test_macro = df[test_mask][macro_cols].copy()
-    
-    print(f"Train: {len(train_core):,}, Val: {len(val_core):,}, Test: {len(test_core):,}")
-    
-    # If no data in time splits, use random split as fallback
-    if len(train_core) == 0 or len(val_core) == 0 or len(test_core) == 0:
-        print("Warning: Time-based split resulted in empty datasets. Using random split as fallback.")
-        train_size = int(0.7 * len(df))
-        val_size = int(0.15 * len(df))
-        
-        df_shuffled = df.sample(frac=1, random_state=42).reset_index(drop=True)
-        
-        train_core = df_shuffled[:train_size][core_cols].copy()
-        val_core = df_shuffled[train_size:train_size+val_size][core_cols].copy()
-        test_core = df_shuffled[train_size+val_size:][core_cols].copy()
-        
-        train_macro = df_shuffled[:train_size][macro_cols].copy()
-        val_macro = df_shuffled[train_size:train_size+val_size][macro_cols].copy()
-        test_macro = df_shuffled[train_size+val_size:][macro_cols].copy()
-        
-        print(f"Fallback split - Train: {len(train_core):,}, Val: {len(val_core):,}, Test: {len(test_core):,}")
-    
-    gc.collect()
-    return (train_core, val_core, test_core), (train_macro, val_macro, test_macro)
-
-# STEP 4: FIXED Preprocessing with Enhanced NaN Handling
-def optimized_preprocessing(datasets):
+def smart_sample(df, target_size=500000, event_col='survival_event', duration_col='survival_time'):
     """
-    Enhanced preprocessing with comprehensive NaN handling and data validation
+    Intelligent sampling that preserves statistical properties
     """
-    train_df, val_df, test_df = datasets
+    print(f"Original data size: {len(df):,} rows")
     
-    print(f"Initial data shapes: Train={train_df.shape}, Val={val_df.shape}, Test={test_df.shape}")
+    if len(df) <= target_size:
+        print("Data size is acceptable, no sampling needed")
+        return df.copy()
     
-    # Check for NaN values before processing
-    print("Checking for NaN values in datasets...")
-    for name, df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
-        nan_counts = df.isnull().sum()
-        total_nans = nan_counts.sum()
-        if total_nans > 0:
-            print(f"{name} dataset has {total_nans} NaN values:")
-            print(nan_counts[nan_counts > 0])
+    # Stratified sampling to maintain event ratio and duration distribution
+    print("Performing stratified sampling...")
     
-    # Compute statistics only from training data
-    train_stats = {}
+    # Create strata based on events and duration quartiles
+    df_sample = df.copy()
     
-    # Separate numeric and categorical columns
-    numeric_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = [col for col in numeric_cols if col not in [duration_col, event_col]]
+    # Add quartile bins for stratification
+    df_sample['duration_quartile'] = pd.qcut(df_sample[duration_col], 
+                                           q=4, labels=['Q1', 'Q2', 'Q3', 'Q4'], 
+                                           duplicates='drop')
     
-    categorical_cols = train_df.select_dtypes(include=['category', 'object']).columns.tolist()
+    # Create combined strata
+    df_sample['strata'] = df_sample[event_col].astype(str) + '_' + df_sample['duration_quartile'].astype(str)
     
-    print(f"Numeric columns: {len(numeric_cols)}")
-    print(f"Categorical columns: {len(categorical_cols)}")
+    # Stratified sampling
+    sss = StratifiedShuffleSplit(n_splits=1, 
+                                train_size=target_size/len(df), 
+                                random_state=42)
     
-    # Store training statistics for imputation
-    for col in numeric_cols:
-        if col in train_df.columns:
-            # Use median for numeric, but handle edge cases
-            median_val = train_df[col].median()
-            if pd.isna(median_val):
-                # If median is NaN, use 0 or column mean
-                mean_val = train_df[col].mean()
-                train_stats[col] = 0 if pd.isna(mean_val) else mean_val
-            else:
-                train_stats[col] = median_val
+    train_idx, _ = next(sss.split(df_sample, df_sample['strata']))
+    sampled_df = df_sample.iloc[train_idx].drop(['duration_quartile', 'strata'], axis=1)
     
-    for col in categorical_cols:
-        if col in train_df.columns:
-            mode_vals = train_df[col].mode()
-            train_stats[col] = mode_vals[0] if len(mode_vals) > 0 else 'Unknown'
+    # Verify sampling quality
+    orig_event_rate = df[event_col].mean()
+    sample_event_rate = sampled_df[event_col].mean()
     
-    # Apply preprocessing to all datasets
-    clean_datasets = []
-    for dataset_name, df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
-        print(f"\nProcessing {dataset_name} dataset...")
-        df_clean = df.copy()
-        
-        # Fill missing values using training statistics
-        for col in numeric_cols:
-            if col in df_clean.columns:
-                missing_before = df_clean[col].isnull().sum()
-                df_clean[col] = df_clean[col].fillna(train_stats[col])
-                missing_after = df_clean[col].isnull().sum()
-                if missing_before > 0:
-                    print(f"  {col}: filled {missing_before} missing values")
-        
-        for col in categorical_cols:
-            if col in df_clean.columns:
-                missing_before = df_clean[col].isnull().sum()
-                df_clean[col] = df_clean[col].fillna(train_stats[col])
-                missing_after = df_clean[col].isnull().sum()
-                if missing_before > 0:
-                    print(f"  {col}: filled {missing_before} missing values")
-        
-        # Handle survival time and event columns specifically
-        print(f"  Checking survival_time and default_event columns...")
-        
-        # Remove rows with invalid survival times or events
-        before_cleaning = len(df_clean)
-        
-        # Remove rows where survival_time is NaN, <= 0, or infinite
-        valid_survival = (
-            df_clean[duration_col].notna() & 
-            (df_clean[duration_col] > 0) & 
-            np.isfinite(df_clean[duration_col])
-        )
-        
-        # Remove rows where event is NaN or not 0/1
-        valid_event = (
-            df_clean[event_col].notna() & 
-            df_clean[event_col].isin([0, 1])
-        )
-        
-        # Combine conditions
-        valid_rows = valid_survival & valid_event
-        df_clean = df_clean[valid_rows].copy()
-        
-        after_cleaning = len(df_clean)
-        removed_rows = before_cleaning - after_cleaning
-        
-        if removed_rows > 0:
-            print(f"  Removed {removed_rows} rows with invalid survival_time or default_event")
-        
-        # Final check for any remaining NaN values
-        remaining_nans = df_clean.isnull().sum().sum()
-        if remaining_nans > 0:
-            print(f"  Warning: {remaining_nans} NaN values remain in {dataset_name}")
-            # Show which columns still have NaN
-            nan_cols = df_clean.columns[df_clean.isnull().any()].tolist()
-            for col in nan_cols:
-                nan_count = df_clean[col].isnull().sum()
-                print(f"    {col}: {nan_count} NaN values")
-            
-            # Drop rows with any remaining NaN values
-            df_clean = df_clean.dropna()
-            print(f"  Dropped rows with NaN, final shape: {df_clean.shape}")
-        
-        clean_datasets.append(df_clean)
+    print(f"Sampled data size: {len(sampled_df):,} rows")
+    print(f"Original event rate: {orig_event_rate:.3f}")
+    print(f"Sample event rate: {sample_event_rate:.3f}")
+    print(f"Event rate preservation: {abs(orig_event_rate - sample_event_rate):.4f} difference")
     
-    print(f"\nAfter preprocessing - Train: {len(clean_datasets[0]):,}, "
-          f"Val: {len(clean_datasets[1]):,}, Test: {len(clean_datasets[2]):,}")
-    
-    # Categorical encoding
-    train_clean, val_clean, test_clean = clean_datasets
-    
-    # Get categorical columns that exist in the data
-    categorical_cols_existing = [col for col in categorical_cols if col in train_clean.columns]
-    
-    if categorical_cols_existing:
-        print(f"\nEncoding {len(categorical_cols_existing)} categorical features...")
-        
-        # Create dummy variables using training data to define categories
-        train_encoded = pd.get_dummies(train_clean, columns=categorical_cols_existing, 
-                                     drop_first=True, dtype='int8')
-        
-        # Get the column names after encoding
-        encoded_cols = train_encoded.columns.tolist()
-        
-        # Apply same encoding to validation and test (align columns)
-        val_encoded = pd.get_dummies(val_clean, columns=categorical_cols_existing, 
-                                   drop_first=True, dtype='int8')
-        test_encoded = pd.get_dummies(test_clean, columns=categorical_cols_existing, 
-                                    drop_first=True, dtype='int8')
-        
-        # Align columns (add missing columns with 0s)
-        for df_encoded in [val_encoded, test_encoded]:
-            for col in encoded_cols:
-                if col not in df_encoded.columns:
-                    df_encoded[col] = 0
-        
-        # Reorder columns to match training data
-        val_encoded = val_encoded[encoded_cols]
-        test_encoded = test_encoded[encoded_cols]
-        
-        # Final NaN check after encoding
-        for name, df_enc in [("Train", train_encoded), ("Val", val_encoded), ("Test", test_encoded)]:
-            nan_count = df_enc.isnull().sum().sum()
-            if nan_count > 0:
-                print(f"  Warning: {name} has {nan_count} NaN values after encoding")
-                # Remove any remaining NaN rows
-                df_enc = df_enc.dropna()
-        
-        print(f"After encoding - Features: {len(encoded_cols) - 2}")  # -2 for duration and event cols
-        
-        return [train_encoded, val_encoded, test_encoded]
-    else:
-        print("No categorical features to encode")
-        return clean_datasets
+    return sampled_df
 
-# STEP 5: FIXED Cox Model Fitting with Better Error Handling
-def fit_optimized_cox(train_data, val_data, duration_col, event_col, model_name="Model"):
+def load_and_prepare_data_efficiently(filepath):
     """
-    Fit optimized Cox model with comprehensive error handling and data validation
+    Efficiently load and prepare large parquet file
     """
-    print(f"\nFitting {model_name}...")
+    print(f"Loading data from {filepath}")
+    print(f"Available RAM: {psutil.virtual_memory().available / 1024**3:.1f} GB")
     
-    # Comprehensive data validation
-    print(f"Data shape: {train_data.shape}")
-    print(f"Duration column '{duration_col}' stats:")
-    print(f"  Min: {train_data[duration_col].min():.4f}")
-    print(f"  Max: {train_data[duration_col].max():.4f}")
-    print(f"  Mean: {train_data[duration_col].mean():.4f}")
-    print(f"  NaN count: {train_data[duration_col].isnull().sum()}")
-    
-    print(f"Event column '{event_col}' stats:")
-    print(f"  Value counts: {train_data[event_col].value_counts().to_dict()}")
-    print(f"  NaN count: {train_data[event_col].isnull().sum()}")
-    
-    # Check for any remaining NaN values
-    total_nans = train_data.isnull().sum().sum()
-    if total_nans > 0:
-        print(f"ERROR: Found {total_nans} NaN values in training data")
-        nan_cols = train_data.columns[train_data.isnull().any()].tolist()
-        for col in nan_cols:
-            nan_count = train_data[col].isnull().sum()
-            print(f"  {col}: {nan_count} NaN values")
-        
-        # Remove rows with NaN values
-        print("Removing rows with NaN values...")
-        train_data = train_data.dropna()
-        val_data = val_data.dropna()
-        print(f"After NaN removal - Train: {len(train_data)}, Val: {len(val_data)}")
-    
-    # Check for infinite values
-    numeric_cols = train_data.select_dtypes(include=[np.number]).columns
-    for col in numeric_cols:
-        inf_count = np.isinf(train_data[col]).sum()
-        if inf_count > 0:
-            print(f"WARNING: Found {inf_count} infinite values in {col}")
-            # Replace infinite values with median
-            median_val = train_data[col][np.isfinite(train_data[col])].median()
-            train_data[col] = train_data[col].replace([np.inf, -np.inf], median_val)
-            val_data[col] = val_data[col].replace([np.inf, -np.inf], median_val)
-    
-    # Ensure event column is properly coded
-    if not train_data[event_col].isin([0, 1]).all():
-        print(f"ERROR: Event column contains values other than 0 and 1")
-        return None, 0.0
-    
-    # Check for variance in features
-    feature_cols = [col for col in train_data.columns if col not in [duration_col, event_col]]
-    zero_var_cols = []
-    for col in feature_cols:
-        if train_data[col].var() == 0:
-            zero_var_cols.append(col)
-    
-    if zero_var_cols:
-        print(f"Removing {len(zero_var_cols)} zero-variance features: {zero_var_cols}")
-        train_data = train_data.drop(columns=zero_var_cols)
-        val_data = val_data.drop(columns=zero_var_cols)
-    
-    # Final data validation
-    print(f"Final training data shape: {train_data.shape}")
-    print(f"Event rate: {train_data[event_col].mean():.4f}")
-    
-    # Fit Cox model with more conservative settings
     try:
-        cox_model = CoxPHFitter(
-            penalizer=0.1,     # Increased regularization
-            l1_ratio=0.1,      # Mostly Ridge regularization
-            alpha=0.05
-        )
+        # Load with optimized settings
+        df = pd.read_parquet(filepath, 
+                           engine='pyarrow',
+                           use_nullable_dtypes=True)
         
-        # Fit the model
-        cox_model.fit(
-            train_data, 
-            duration_col=duration_col, 
-            event_col=event_col,
-            show_progress=True
-        )
+        print(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
         
-        # Validation performance
-        val_c_index = concordance_index(
-            val_data[duration_col], 
-            -cox_model.predict_partial_hazard(val_data), 
-            val_data[event_col]
-        )
+        # Immediate memory optimization
+        df = optimize_dtypes(df)
         
-        print(f"{model_name} - Validation C-index: {val_c_index:.4f}")
-        print(f"{model_name} - Coefficients: {cox_model.summary.shape[0]}")
+        # Handle datetime columns efficiently
+        datetime_cols = ['ORIG_DATE', 'FORECLOSURE_DATE', 'MATR_DT', 'quarter']
+        for col in datetime_cols:
+            if col in df.columns:
+                try:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                except:
+                    continue
         
-        return cox_model, val_c_index
+        # Smart sampling for Mac Air constraints
+        df = smart_sample(df)
+        
+        # Final cleanup
+        gc.collect()
+        
+        return df
         
     except Exception as e:
-        print(f"Error fitting {model_name}: {str(e)}")
-        print("Trying with higher regularization...")
-        
-        # Try with higher regularization
-        try:
-            cox_model = CoxPHFitter(
-                penalizer=0.5,     # Much higher regularization
-                l1_ratio=0.0,      # Pure Ridge regularization
-                alpha=0.05
-            )
-            
-            cox_model.fit(
-                train_data, 
-                duration_col=duration_col, 
-                event_col=event_col,
-                show_progress=True
-            )
-            
-            val_c_index = concordance_index(
-                val_data[duration_col], 
-                -cox_model.predict_partial_hazard(val_data), 
-                val_data[event_col]
-            )
-            
-            print(f"{model_name} (high reg) - Validation C-index: {val_c_index:.4f}")
-            return cox_model, val_c_index
-            
-        except Exception as e2:
-            print(f"Failed even with high regularization: {str(e2)}")
-            return None, 0.0
+        print(f"Error loading data: {e}")
+        return None
 
-# STEP 6: Compare Models
-def compare_models(core_model, macro_model, core_data, macro_data):
-    """Comprehensive comparison of both models"""
-    print("\n" + "="*60)
-    print("MODEL COMPARISON RESULTS")
-    print("="*60)
+def identify_macro_features_fast(df):
+    """Fast macro feature identification"""
+    macro_keywords = [
+        'rates_PC', 'employment_PC', 'inflation_PC', 'activity_PC', 
+        'housing_PC', 'sentiment_PC', 'UNRATE', 'FEDFUNDS', 'GS10', 
+        'CFNAI', 'yield_spread', 'unemployment_regime', 'interest_rate_regime',
+        'yield_curve_regime', 'economic_stress', 'yield_curve_inversion',
+        'macro_quarter'
+    ]
     
-    results = {}
+    macro_features = [col for col in df.columns 
+                     if any(keyword in col for keyword in macro_keywords)]
     
-    for model_name, model, data in [("Core", core_model, core_data), ("Macro", macro_model, macro_data)]:
-        if model is None:
-            print(f"\n{model_name} Model: FAILED TO FIT")
-            continue
-            
-        train_data, val_data, test_data = data
-        
-        # Calculate performance metrics
-        train_c = concordance_index(
-            train_data[duration_col], 
-            -model.predict_partial_hazard(train_data), 
-            train_data[event_col]
-        )
-        
-        val_c = concordance_index(
-            val_data[duration_col], 
-            -model.predict_partial_hazard(val_data), 
-            val_data[event_col]
-        )
-        
-        test_c = concordance_index(
-            test_data[duration_col], 
-            -model.predict_partial_hazard(test_data), 
-            test_data[event_col]
-        )
-        
-        results[model_name] = {
-            'train_c': train_c,
-            'val_c': val_c, 
-            'test_c': test_c,
-            'features': model.summary.shape[0]
-        }
-        
-        print(f"\n{model_name} Model Results:")
-        print(f"  Features: {model.summary.shape[0]}")
-        print(f"  Train C-index: {train_c:.4f}")
-        print(f"  Val C-index: {val_c:.4f}")
-        print(f"  Test C-index: {test_c:.4f}")
-        print(f"  Overfit (Train-Test): {(train_c - test_c):.4f}")
-        
-        # Top features
-        if hasattr(model, 'summary') and len(model.summary) > 0:
-            print(f"  Top 5 Features:")
-            top_features = model.summary['coef'].abs().sort_values(ascending=False).head(5)
-            for i, (feature, coef) in enumerate(top_features.items(), 1):
-                direction = "↑" if model.summary.loc[feature, 'coef'] > 0 else "↓"
-                print(f"    {i}. {feature}: {coef:.3f} {direction}")
-    
-    # Model comparison summary
-    print(f"\n" + "="*60)
-    print("COMPARISON SUMMARY")
-    print("="*60)
-    
-    if 'Core' in results and 'Macro' in results:
-        core_test = results['Core']['test_c']
-        macro_test = results['Macro']['test_c']
-        improvement = macro_test - core_test
-        
-        print(f"Core Model Test C-index: {core_test:.4f}")
-        print(f"Macro Model Test C-index: {macro_test:.4f}")
-        print(f"Improvement from Macro: {improvement:.4f} ({improvement/core_test*100:.1f}%)")
-        
-        if improvement > 0.005:
-            print("✅ Macro features provide meaningful improvement")
-        else:
-            print("❌ Macro features don't provide significant improvement")
-    
-    return results
+    print(f"Identified {len(macro_features)} macro features")
+    return macro_features
 
-# STEP 7: Generate Predictions
-def generate_predictions(model, test_data, model_name="Model"):
-    """Generate predictions for IFRS9 compliance"""
-    print(f"\nGenerating predictions from {model_name}...")
+def prepare_cox_data_efficient(df, duration_col='survival_time', event_col='survival_event'):
+    """
+    Efficient Cox data preparation with enhanced data cleaning
+    """
+    print("Preparing Cox regression data...")
     
-    # Sample for memory efficiency
-    sample_size = min(2000, len(test_data))
-    pred_sample = test_data.sample(n=sample_size, random_state=42)
+    # Check if required columns exist
+    if duration_col not in df.columns or event_col not in df.columns:
+        print(f"Required columns missing: {duration_col}, {event_col}")
+        return None, None
     
-    predictions = pred_sample.copy()
+    # Essential columns to keep
+    essential_cols = [duration_col, event_col]
     
-    # Risk scores
-    predictions['risk_score'] = model.predict_partial_hazard(pred_sample)
+    # Columns to exclude (reduce dimensionality)
+    exclude_patterns = [
+        'LOAN_ID', 'Zero_Bal_Code', 'quarter', 'orig_year',
+        'default_events', 'stage2_event', 'time_to_default_raw',
+        'stage2_survival_time', 'stage2_survival_event',
+        'ifrs9_stage', 'default_12m', 'stage2_12m', 'ORIG_DATE',
+        'FORECLOSURE_DATE', 'MATR_DT'
+    ]
     
-    # Survival probabilities for key horizons
-    for horizon in [6, 12, 24]:
-        survival_probs = []
-        for i in range(len(pred_sample)):
+    # Select numeric feature columns only
+    feature_cols = []
+    for col in df.columns:
+        if (col not in essential_cols and 
+            not any(pattern in col for pattern in exclude_patterns) and
+            pd.api.types.is_numeric_dtype(df[col]) and
+            df[col].var() > 0):  # Remove zero-variance columns
+            feature_cols.append(col)
+    
+    print(f"Selected {len(feature_cols)} numeric features for modeling")
+    
+    # Create final dataset with only necessary columns
+    final_cols = essential_cols + feature_cols
+    cox_data = df[final_cols].copy()
+    
+    # Enhanced data cleaning
+    print("Cleaning data...")
+    original_rows = len(cox_data)
+    
+    # Remove invalid durations and events
+    cox_data = cox_data.dropna(subset=essential_cols)
+    cox_data = cox_data[cox_data[duration_col] > 0]
+    cox_data = cox_data[cox_data[event_col].isin([0, 1])]
+    
+    print(f"Removed {original_rows - len(cox_data):,} rows with invalid duration/event data")
+    
+    # Handle remaining NaNs in features
+    for col in feature_cols:
+        if cox_data[col].isna().any():
+            # Use median for numeric columns
+            median_val = cox_data[col].median()
+            cox_data[col] = cox_data[col].fillna(median_val)
+    
+    # Remove features with infinite values
+    for col in feature_cols:
+        if np.isinf(cox_data[col]).any():
+            print(f"Removing feature {col} due to infinite values")
+            cox_data = cox_data.drop(columns=[col])
+            feature_cols.remove(col)
+    
+    # Final validation
+    print(f"Final Cox data: {len(cox_data):,} rows, {len(feature_cols)} features")
+    print(f"Event rate: {cox_data[event_col].mean():.3f}")
+    print(f"Duration range: {cox_data[duration_col].min():.1f} to {cox_data[duration_col].max():.1f}")
+    
+    # Memory cleanup
+    del df
+    gc.collect()
+    
+    return cox_data, feature_cols
+
+def fit_cox_model_optimized(data, features, duration_col='survival_time', 
+                           event_col='survival_event', model_name="Model",
+                           max_features=50):
+    """
+    Optimized Cox model fitting with feature selection
+    """
+    print(f"\nFitting {model_name}")
+    print(f"Memory usage: {get_memory_usage():.1f} MB")
+    
+    # Feature selection if too many features
+    if len(features) > max_features:
+        print(f"Reducing {len(features)} features to {max_features} via correlation analysis...")
+        
+        # Calculate correlation with target (for feature selection)
+        feature_data = data[features + [event_col]]
+        correlations = feature_data.corr()[event_col].abs().sort_values(ascending=False)
+        selected_features = correlations.head(max_features).index.tolist()
+        selected_features.remove(event_col)
+        features = selected_features
+        print(f"Selected {len(features)} most predictive features")
+    
+    # Prepare model data
+    model_cols = [duration_col, event_col] + features
+    model_data = data[model_cols].copy()
+    
+    # Standardize features in chunks to save memory
+    print("Standardizing features...")
+    scaler = StandardScaler()
+    
+    # Fit scaler on sample, transform in chunks
+    sample_size = min(10000, len(model_data))
+    sample_idx = np.random.choice(len(model_data), sample_size, replace=False)
+    scaler.fit(model_data.iloc[sample_idx][features])
+    
+    # Transform in chunks
+    chunk_size = 10000
+    for i in range(0, len(model_data), chunk_size):
+        end_idx = min(i + chunk_size, len(model_data))
+        model_data.loc[model_data.index[i:end_idx], features] = scaler.transform(
+            model_data.iloc[i:end_idx][features]
+        )
+    
+    # Fit Cox model with optimized settings
+    print("Fitting Cox proportional hazards model...")
+    cph = CoxPHFitter(penalizer=0.01)  # Light regularization for stability
+    
+    try:
+        # Fit model with compatible parameters
+        cph.fit(model_data, duration_col=duration_col, event_col=event_col, 
+               show_progress=False)
+        
+        print(f"✓ Model fitted successfully!")
+        print(f"  Features: {len(features)}")
+        print(f"  Observations: {len(model_data):,}")
+        print(f"  Events: {int(model_data[event_col].sum()):,}")
+        print(f"  Concordance Index: {cph.concordance_index_:.4f}")
+        print(f"  Partial AIC: {cph.AIC_partial_:.2f}")
+        
+        # Force garbage collection
+        gc.collect()
+        
+        return cph, scaler, model_data, features
+        
+    except Exception as e:
+        print(f"✗ Error fitting {model_name}: {str(e)}")
+        
+        # Additional debugging
+        print(f"  Model data shape: {model_data.shape}")
+        print(f"  Features with NaN: {model_data[features].isna().sum().sum()}")
+        print(f"  Duration range: {model_data[duration_col].min():.2f} to {model_data[duration_col].max():.2f}")
+        print(f"  Event rate: {model_data[event_col].mean():.3f}")
+        
+        # Try with even more regularization
+        if 'penalizer' not in str(e).lower():
+            print("Trying with stronger regularization...")
             try:
-                survival_func = model.predict_survival_function(pred_sample.iloc[[i]])
-                times = survival_func.index
+                cph_robust = CoxPHFitter(penalizer=0.1)
+                cph_robust.fit(model_data, duration_col=duration_col, event_col=event_col, 
+                             show_progress=False)
                 
-                if horizon <= times.max():
-                    # Find closest time
-                    closest_time = min(times, key=lambda x: abs(x - horizon))
-                    prob = survival_func.loc[closest_time].iloc[0]
-                else:
-                    prob = 0.0  # Assume default if beyond observation
+                print(f"✓ Robust model fitted!")
+                print(f"  Concordance Index: {cph_robust.concordance_index_:.4f}")
+                gc.collect()
+                return cph_robust, scaler, model_data, features
                 
-                survival_probs.append(prob)
-            except:
-                survival_probs.append(np.nan)
+            except Exception as e2:
+                print(f"✗ Robust fitting also failed: {str(e2)}")
         
-        predictions[f'survival_prob_{horizon}m'] = survival_probs
-        predictions[f'default_prob_{horizon}m'] = 1 - np.array(survival_probs)
+        # Final fallback: reduce features more aggressively
+        if len(features) > 15:
+            print(f"Final attempt with top 15 features...")
+            features_minimal = features[:15]
+            return fit_cox_model_optimized(data, features_minimal, duration_col, 
+                                         event_col, f"{model_name} (Minimal)", 15)
+        
+        return None, None, None, None
+
+def compare_models_efficient(model1, model2, data1, data2, features1, features2,
+                           model1_name="Non-Macro", model2_name="Full"):
+    """
+    Efficient model comparison - FIXED to use AIC_partial_
+    """
+    print(f"\n{'='*60}")
+    print(f"MODEL COMPARISON: {model1_name} vs {model2_name}")
+    print(f"{'='*60}")
     
-    # Risk tiers
-    predictions['risk_tier'] = pd.cut(
-        predictions['risk_score'],
-        bins=[0, 0.3, 0.7, 1.5, float('inf')],
-        labels=['Low', 'Medium', 'High', 'Very High']
+    if model1 is None or model2 is None:
+        print("Cannot compare - one or both models failed to fit")
+        return
+    
+    # Comparison metrics
+    metrics = {
+        'Model': [model1_name, model2_name],
+        'Features': [len(features1), len(features2)],
+        'Observations': [f"{len(data1):,}", f"{len(data2):,}"],
+        'Events': [f"{int(data1[model1.event_col].sum()):,}", 
+                   f"{int(data2[model2.event_col].sum()):,}"],
+        'C-Index': [f"{model1.concordance_index_:.4f}", 
+                    f"{model2.concordance_index_:.4f}"],
+        'Partial AIC': [f"{model1.AIC_partial_:.1f}", f"{model2.AIC_partial_:.1f}"],
+        'Log-Likelihood': [f"{model1.log_likelihood_:.1f}", 
+                          f"{model2.log_likelihood_:.1f}"]
+    }
+    
+    comparison_df = pd.DataFrame(metrics)
+    print(comparison_df.to_string(index=False))
+    
+    # Key metrics comparison
+    c_improvement = model2.concordance_index_ - model1.concordance_index_
+    aic_improvement = model1.AIC_partial_ - model2.AIC_partial_  # Lower AIC is better
+    
+    print(f"\n{'='*40}")
+    print("KEY RESULTS")
+    print(f"{'='*40}")
+    print(f"C-Index Improvement: {c_improvement:+.4f} ({c_improvement*100:+.2f}%)")
+    print(f"Partial AIC Improvement: {aic_improvement:+.1f}")
+    
+    if c_improvement > 0.01:
+        print("✓ MEANINGFUL predictive improvement with macro features")
+    elif c_improvement > 0.005:
+        print("~ MODEST predictive improvement with macro features")
+    else:
+        print("✗ MINIMAL predictive improvement with macro features")
+    
+    if aic_improvement > 2:
+        print("✓ SUBSTANTIAL model improvement (Partial AIC)")
+    elif aic_improvement > 0:
+        print("~ MINOR model improvement (Partial AIC)")
+    else:
+        print("✗ MODEL COMPLEXITY may not be justified (Partial AIC)")
+    
+    # Statistical test if models are nested
+    if len(features2) > len(features1):
+        lr_stat = 2 * (model2.log_likelihood_ - model1.log_likelihood_)
+        df_diff = len(features2) - len(features1)
+        if df_diff > 0:
+            p_value = 1 - stats.chi2.cdf(lr_stat, df_diff)
+            print(f"\nLikelihood Ratio Test:")
+            print(f"  LR statistic: {lr_stat:.2f}")
+            print(f"  p-value: {p_value:.4f}")
+            print(f"  {'✓ SIGNIFICANT' if p_value < 0.05 else '✗ NOT SIGNIFICANT'} (α=0.05)")
+
+def main_analysis_optimized(filepath_or_df):
+    """
+    Main optimized analysis for Mac Air
+    """
+    print("="*80)
+    print("OPTIMIZED COX MODEL COMPARISON FOR MAC AIR")
+    print("Non-Macro vs Macro Features Analysis")
+    print("="*80)
+    
+    # Load data efficiently
+    if isinstance(filepath_or_df, str):
+        df = load_and_prepare_data_efficiently(filepath_or_df)
+    else:
+        print("Using provided DataFrame...")
+        df = optimize_dtypes(filepath_or_df.copy())
+        df = smart_sample(df)
+    
+    if df is None:
+        print("Failed to load data")
+        return None
+    
+    # Identify features
+    macro_features = identify_macro_features_fast(df)
+    
+    # Prepare Cox data
+    try:
+        cox_data, all_features = prepare_cox_data_efficient(df)
+    except Exception as e:
+        print(f"Error preparing data: {e}")
+        return None
+    
+    if cox_data is None:
+        print("Failed to prepare Cox data")
+        return None
+    
+    # Split features
+    non_macro_features = [f for f in all_features if f not in macro_features]
+    
+    print(f"\n📊 FEATURE SUMMARY:")
+    print(f"  Non-macro features: {len(non_macro_features)}")
+    print(f"  Macro features: {len(macro_features)}")
+    print(f"  Total features: {len(all_features)}")
+    
+    # Fit models
+    print(f"\n🔧 FITTING MODELS:")
+    
+    # Non-macro model
+    model1, scaler1, data1, features1 = fit_cox_model_optimized(
+        cox_data, non_macro_features, model_name="Non-Macro Model", max_features=30
     )
     
-    return predictions
-
-# MAIN EXECUTION
-print("Starting Cox Regression Analysis with Enhanced NaN Handling...")
-
-# Load data
-df = load_and_stratified_sample('/Users/sundargodina/new.parquet')
-
-# Apply time-based split
-(train_core, val_core, test_core), (train_macro, val_macro, test_macro) = enhanced_time_split(df)
-
-# Preprocess data with enhanced NaN handling
-print("\n" + "="*60)
-print("PREPROCESSING CORE MODEL DATA")
-print("="*60)
-core_clean = optimized_preprocessing([train_core, val_core, test_core])
-
-print("\n" + "="*60)
-print("PREPROCESSING MACRO MODEL DATA")
-print("="*60)
-macro_clean = optimized_preprocessing([train_macro, val_macro, test_macro])
-
-# Fit models
-core_model, core_val_c = fit_optimized_cox(
-    core_clean[0], core_clean[1], duration_col, event_col, "Core Model"
-)
-
-macro_model, macro_val_c = fit_optimized_cox(
-    macro_clean[0], macro_clean[1], duration_col, event_col, "Macro Model"
-)
-
-# Compare models
-comparison_results = compare_models(core_model, macro_model, core_clean, macro_clean)
-
-# Generate predictions
-if core_model:
-    core_predictions = generate_predictions(core_model, core_clean[2], "Core Model")
-    print(f"\nCore model predictions sample:")
-    print(core_predictions[['risk_score', 'default_prob_12m', 'risk_tier']].head())
+    # Full model  
+    model2, scaler2, data2, features2 = fit_cox_model_optimized(
+        cox_data, all_features, model_name="Full Model", max_features=50
+    )
     
-if macro_model:
-    macro_predictions = generate_predictions(macro_model, macro_clean[2], "Macro Model")
-    print(f"\nMacro model predictions sample:")
-    print(macro_predictions[['risk_score', 'default_prob_12m', 'risk_tier']].head())
+    # Compare models
+    if model1 is not None and model2 is not None:
+        compare_models_efficient(model1, model2, data1, data2, 
+                                features1, features2)
+        
+        # Memory cleanup
+        del cox_data, df
+        gc.collect()
+        
+        print(f"\nFinal memory usage: {get_memory_usage():.1f} MB")
+        
+        return {
+            'non_macro_model': model1,
+            'full_model': model2,
+            'non_macro_features': features1,
+            'macro_features': [f for f in features2 if f in macro_features],
+            'memory_usage': get_memory_usage()
+        }
+    else:
+        print("One or both models failed to fit")
+        return None
 
-print("\n" + "="*60)
-print("ANALYSIS COMPLETE")
-print("="*60)
+# Run the analysis
+if __name__ == "__main__":
+    results = main_analysis_optimized("/Users/sundargodina/Downloads/fred/survival_with_macro_no_nulls.parquet")
+    print("\nOptimizations applied:")
+    print("• Smart stratified sampling to ~500K rows")
+    print("• Memory-efficient data types")
+    print("• Feature selection (top 30 non-macro, 50 total)")
+    print("• Chunked processing")
+    print("• Regularized Cox models for stability")
+    print("• Memory cleanup throughout")
+    print("• Fixed AIC issue by using AIC_partial_")
