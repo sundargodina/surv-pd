@@ -176,7 +176,9 @@ def prepare_cox_data_efficient(df, duration_col='survival_time', event_col='surv
         'default_events', 'stage2_event', 'time_to_default_raw',
         'stage2_survival_time', 'stage2_survival_event',
         'ifrs9_stage', 'default_12m', 'stage2_12m', 'ORIG_DATE',
-        'FORECLOSURE_DATE', 'MATR_DT'
+        'FORECLOSURE_DATE', 'MATR_DT','default_event', 'ever_default_dlq', 'first_default_age_dlq',
+    'ever_stage2', 'first_stage2_age', 'ever_default_zb',
+    'last_observed_age'
     ]
     
     # Select numeric feature columns only
@@ -274,7 +276,7 @@ def fit_cox_model_optimized(data, features, duration_col='survival_time',
     
     # Fit Cox model with optimized settings
     print("Fitting Cox proportional hazards model...")
-    cph = CoxPHFitter(penalizer=0.01)  # Light regularization for stability
+    cph = CoxPHFitter(penalizer=0.1)  # Light regularization for stability
     
     try:
         # Fit model with compatible parameters
@@ -287,11 +289,35 @@ def fit_cox_model_optimized(data, features, duration_col='survival_time',
         print(f"  Events: {int(model_data[event_col].sum()):,}")
         print(f"  Concordance Index: {cph.concordance_index_:.4f}")
         print(f"  Partial AIC: {cph.AIC_partial_:.2f}")
+
         
         # Force garbage collection
         gc.collect()
         
-        return cph, scaler, model_data, features
+        
+        # Add predictions and diagnostics
+        model_data['predicted_partial_hazard'] = cph.predict_partial_hazard(model_data).values
+
+        # Estimate baseline cumulative hazard at the final observed duration
+        baseline_hazard = cph.baseline_cumulative_hazard_
+        model_data['baseline_cumulative_hazard'] = baseline_hazard.iloc[-1, 0]
+
+        # Expected cumulative hazard is: baseline_hazard * partial hazard
+        model_data['expected_cumulative_hazard'] = (
+        model_data['predicted_partial_hazard'] * model_data['baseline_cumulative_hazard']
+        )
+
+        # Residual: actual time - expected hazard
+        model_data['residual'] = model_data[duration_col] - model_data['expected_cumulative_hazard']
+
+        # Final return structure
+        return {
+            'model': cph,
+            'scaler': scaler,
+            'data': model_data,
+            'features': features,
+        }
+
         
     except Exception as e:
         print(f"✗ Error fitting {model_name}: {str(e)}")
@@ -394,11 +420,12 @@ def compare_models_efficient(model1, model2, data1, data2, features1, features2,
 
 def main_analysis_optimized(filepath_or_df):
     """
-    Main optimized analysis for Mac Air
+    Main optimized analysis with macro_quarter-based time split:
+    Train on 2016Q4 to 2020Q4, test on 2021Q1 to 2022Q3
     """
     print("="*80)
-    print("OPTIMIZED COX MODEL COMPARISON FOR MAC AIR")
-    print("Non-Macro vs Macro Features Analysis")
+    print("OPTIMIZED COX MODEL COMPARISON WITH TIME SPLIT")
+    print("Train: Pre-COVID + Early COVID | Test: Post-COVID")
     print("="*80)
     
     # Load data efficiently
@@ -409,75 +436,98 @@ def main_analysis_optimized(filepath_or_df):
         df = optimize_dtypes(filepath_or_df.copy())
         df = smart_sample(df)
     
-    if df is None:
-        print("Failed to load data")
+    if df is None or 'macro_quarter' not in df.columns:
+        print("Missing or invalid input data")
         return None
     
-    # Identify features
+    # Ensure macro_quarter is datetime
+    df['macro_quarter'] = pd.to_datetime(df['macro_quarter'], errors='coerce')
+    
+    # Time-based split
+    train_df = df[df['macro_quarter'] <= '2020-12-31'].copy()
+    test_df  = df[df['macro_quarter'] > '2020-12-31'].copy()
+    
+    print(f"\n📆 SPLIT OVERVIEW:")
+    print(f"Train set: {len(train_df):,} rows (through 2020 Q4)")
+    print(f"Test set: {len(test_df):,} rows (2021 Q1 onward)")
+    
+    # Identify macro features
     macro_features = identify_macro_features_fast(df)
     
-    # Prepare Cox data
-    try:
-        cox_data, all_features = prepare_cox_data_efficient(df)
-    except Exception as e:
-        print(f"Error preparing data: {e}")
+    # Prepare training data
+    cox_train, all_features = prepare_cox_data_efficient(train_df)
+    if cox_train is None:
+        print("Failed to prepare training data")
         return None
     
-    if cox_data is None:
-        print("Failed to prepare Cox data")
-        return None
-    
-    # Split features
     non_macro_features = [f for f in all_features if f not in macro_features]
     
-    print(f"\n📊 FEATURE SUMMARY:")
-    print(f"  Non-macro features: {len(non_macro_features)}")
-    print(f"  Macro features: {len(macro_features)}")
-    print(f"  Total features: {len(all_features)}")
-    
-    # Fit models
-    print(f"\n🔧 FITTING MODELS:")
-    
-    # Non-macro model
-    model1, scaler1, data1, features1 = fit_cox_model_optimized(
-        cox_data, non_macro_features, model_name="Non-Macro Model", max_features=30
+    # Fit models on training data
+    model1 = fit_cox_model_optimized(
+        cox_train, non_macro_features, model_name="Train: Non-Macro Model", max_features=30
+    )
+    model2 = fit_cox_model_optimized(
+        cox_train, all_features, model_name="Train: Full Model", max_features=50
     )
     
-    # Full model  
-    model2, scaler2, data2, features2 = fit_cox_model_optimized(
-        cox_data, all_features, model_name="Full Model", max_features=50
-    )
+    # Prepare test data (apply same cleaning/scaling)
+    cox_test, _ = prepare_cox_data_efficient(test_df)
+    if cox_test is None:
+        print("Failed to prepare test data")
+        return None
     
-    # Compare models
-    if model1 is not None and model2 is not None:
-        compare_models_efficient(model1, model2, data1, data2, 
-                                features1, features2)
+    # Standardize test set with training scaler
+    for model_result in [model1, model2]:
+        if not model_result:
+            continue
+        scaler = model_result['scaler']
+        features = model_result['features']
+        try:
+            cox_test.loc[:, features] = scaler.transform(cox_test[features])
+        except Exception as e:
+            print(f"Scaling failed on test data: {e}")
+            continue
+    
+    # Evaluate trained models on test data
+    print(f"\n📈 EVALUATING MODELS ON TEST DATA (2021–2022):")
+    for model_result, name in zip([model1, model2], ["Non-Macro", "Full"]):
+        if not model_result:
+            print(f"{name} model failed.")
+            continue
+        model = model_result['model']
+        features = model_result['features']
         
-        # Memory cleanup
-        del cox_data, df
-        gc.collect()
+        try:
+            test_cindex = concordance_index(
+                cox_test['survival_time'],
+                -model.predict_partial_hazard(cox_test[features]),
+                cox_test['survival_event']
+            )
+            print(f"{name} Test Concordance Index: {test_cindex:.4f}")
+        except Exception as e:
+            print(f"{name} model evaluation failed: {e}")
+    
+    # Compare models (on training data)
+    if model1 and model2:
+        compare_models_efficient(
+            model1['model'], model2['model'],
+            model1['data'], model2['data'],
+            model1['features'], model2['features']
+        )
         
         print(f"\nFinal memory usage: {get_memory_usage():.1f} MB")
         
         return {
-            'non_macro_model': model1,
-            'full_model': model2,
-            'non_macro_features': features1,
-            'macro_features': [f for f in features2 if f in macro_features],
-            'memory_usage': get_memory_usage()
+            'non_macro': model1,
+            'full': model2,
+            'macro_features': [f for f in model2['features'] if f in macro_features],
+            'non_macro_features': model1['features'],
+            'memory_usage': get_memory_usage(),
         }
     else:
-        print("One or both models failed to fit")
+        print("One or both models failed to fit.")
         return None
 
-# Run the analysis
 if __name__ == "__main__":
     results = main_analysis_optimized("/Users/sundargodina/Downloads/fred/survival_with_macro_no_nulls.parquet")
-    print("\nOptimizations applied:")
-    print("• Smart stratified sampling to ~500K rows")
-    print("• Memory-efficient data types")
-    print("• Feature selection (top 30 non-macro, 50 total)")
-    print("• Chunked processing")
-    print("• Regularized Cox models for stability")
-    print("• Memory cleanup throughout")
-    print("• Fixed AIC issue by using AIC_partial_")
+    
