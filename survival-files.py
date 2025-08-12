@@ -660,3 +660,15 @@ for year in range(2017, 2023):
             continue
 
 print("\n Processing complete!")
+
+
+SURVIVAL_OUTPUT_DIR = "/Users/sundargodina/Downloads/survival_files/"  # change this
+survival_files = sorted(glob(os.path.join(SURVIVAL_OUTPUT_DIR, "survival_*.parquet")))
+print(f"Found {len(survival_files)} survival files")
+
+#Lazy load and concatenate all files
+lazy_frames = [pl.read_parquet(file, use_pyarrow=True).lazy() for file in survival_files]
+combined_lazy = pl.concat(lazy_frames)
+combined_df = combined_lazy.collect(streaming=True)
+output_file = os.path.join(SURVIVAL_OUTPUT_DIR, "survival_all.parquet")
+combined_df.write_parquet(output_file, compression="snappy")
