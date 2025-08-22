@@ -1,1084 +1,633 @@
-# Simplified Domain-Specific PCA on Macroeconomic Data for Survival Analysis
-
 import pandas as pd
-
 import numpy as np
-
 from fredapi import Fred
-
 from sklearn.decomposition import PCA
-
 from sklearn.preprocessing import StandardScaler
-
 from sklearn.impute import SimpleImputer
-
 import warnings
-
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
 
-
-
-FRED_API_KEY = 'putyourkeyhere'
-
-START_DATE = '2012-01-01'
-
-END_DATE = '2023-12-31'
-
-RAW_MACRO_FILE = '/Users/sundargodina/Downloads/fred/raw_macro_data.csv'
-
-
+FRED_API_KEY = 'e6afe32a2806088e5d190997847b1665'
+RAW_MACRO_FILE = '/Users/sundargodina/Downloads/fred/raw_macro_data_by_state.csv'
 
 fred = Fred(api_key=FRED_API_KEY)
 
-
-
-# Core macro variables based on IFRS 9 research
-
-core_variables = {
-
-    'rates': ['FEDFUNDS', 'GS10', 'GS2', 'TB3MS'],
-
-    'credit': ['DBAA', 'DAAA', 'BAMLH0A0HYM2'],
-
-    'employment': ['UNRATE', 'PAYEMS', 'ICSA'],
-
-    'inflation': ['CPIAUCSL', 'CPILFESL', 'PCEPI'],
-
-    'activity': ['GDPC1', 'INDPRO', 'CFNAI'],
-
-    'housing': ['HOUST', 'CSUSHPISA', 'MORTGAGE30US'],
-
-    'stress': ['NFCI', 'VIXCLS', 'TEDRATE'],
-
-    'sentiment': ['UMCSENT', 'SP500']
-
+# State-level macro variables (FRED state-level series)
+state_variables = {
+    'employment': {
+        'unemployment_rate': '{state}UR',  # e.g., CAUR for California
+        'nonfarm_payrolls': '{state}NA',   # e.g., CANA for California
+        'labor_force': '{state}LF',        # e.g., CALF for California
+    },
+    'housing': {
+        'house_price_index': '{state}STHPI',  # e.g., CASTHPI for California
+        'housing_permits': '{state}BPPRIVSA', # e.g., CABPPRIVSA for California
+    },
+    'income': {
+        'per_capita_income': '{state}PCPI',   # e.g., CAPCPI for California
+        'total_wages': '{state}WAGES',        # e.g., CAWAGES for California
+    },
+    'activity': {
+        'coincident_index': '{state}PHCI',    # e.g., CAPHCI for California
+        'gdp': '{state}RGSP',                 # e.g., CARGSP for California
+    }
 }
 
+# National variables that apply to all states (for context)
+national_variables = {
+    'rates': ['FEDFUNDS', 'GS10', 'GS2', 'TB3MS'],
+    'credit': ['DBAA', 'DAAA', 'BAMLH0A0HYM2'],
+    'inflation': ['CPIAUCSL', 'CPILFESL', 'PCEPI'],
+    'stress': ['NFCI', 'VIXCLS', 'TEDRATE'],
+    'sentiment': ['UMCSENT', 'SP500']
+}
 
+# State abbreviations for FRED codes
+STATE_ABBREVIATIONS = {
+    'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR', 'California': 'CA',
+    'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE', 'Florida': 'FL', 'Georgia': 'GA',
+    'Hawaii': 'HI', 'Idaho': 'ID', 'Illinois': 'IL', 'Indiana': 'IN', 'Iowa': 'IA',
+    'Kansas': 'KS', 'Kentucky': 'KY', 'Louisiana': 'LA', 'Maine': 'ME', 'Maryland': 'MD',
+    'Massachusetts': 'MA', 'Michigan': 'MI', 'Minnesota': 'MN', 'Mississippi': 'MS', 'Missouri': 'MO',
+    'Montana': 'MT', 'Nebraska': 'NE', 'Nevada': 'NV', 'New Hampshire': 'NH', 'New Jersey': 'NJ',
+    'New Mexico': 'NM', 'New York': 'NY', 'North Carolina': 'NC', 'North Dakota': 'ND', 'Ohio': 'OH',
+    'Oklahoma': 'OK', 'Oregon': 'OR', 'Pennsylvania': 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC',
+    'South Dakota': 'SD', 'Tennessee': 'TN', 'Texas': 'TX', 'Utah': 'UT', 'Vermont': 'VT',
+    'Virginia': 'VA', 'Washington': 'WA', 'West Virginia': 'WV', 'Wisconsin': 'WI', 'Wyoming': 'WY',
+    'District of Columbia': 'DC'
+}
 
-def fetch_macro_data():
+def fetch_series_with_retry(code, start_date, end_date, max_retries=3):
+    """Fetch FRED series with retry logic, using dynamic start and end dates"""
+    for attempt in range(max_retries):
+        try:
+            data = fred.get_series(code, observation_start=start_date, observation_end=end_date)
+            time.sleep(0.1)  # Rate limiting
+            return data
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"✗ {code}: Failed after {max_retries} attempts - {str(e)}")
+                return pd.Series(dtype=float)
+            time.sleep(1)  # Wait before retry
+    return pd.Series(dtype=float)
 
-    """Fetch macro data with robust error handling"""
-
-    print("Fetching macro data...")
-
-    all_data = pd.DataFrame()
-
+def fetch_state_data(state_abbrev, start_date, end_date):
+    """Fetch all data for a single state"""
+    print(f"Fetching data for {state_abbrev} from {start_date} to {end_date}...")
+    state_data = {}
     
+    # Fetch state-specific variables
+    for domain, variables in state_variables.items():
+        for var_name, code_template in variables.items():
+            code = code_template.format(state=state_abbrev)
+            data = fetch_series_with_retry(code, start_date, end_date)
+            if not data.empty:
+                state_data[f"{state_abbrev}_{var_name}"] = data
+                print(f"  ✓ {code}: {len(data)} observations")
+            else:
+                print(f"  ✗ {code}: No data")
+    
+    return state_abbrev, state_data
 
-    for domain, codes in core_variables.items():
-
-        for code in codes:
-
+def fetch_macro_data_by_state(start_date, end_date):
+    """Fetch macro data for all states with parallel processing"""
+    print(f"Fetching state-level macro data from {start_date} to {end_date}...")
+    
+    # Get unique states from abbreviations
+    states_to_fetch = list(STATE_ABBREVIATIONS.values())
+    
+    all_state_data = {}
+    
+    # Fetch state data in parallel (but with rate limiting)
+    with ThreadPoolExecutor(max_workers=3) as executor:  # Limited workers for rate limiting
+        future_to_state = {executor.submit(fetch_state_data, state, start_date, end_date): state for state in states_to_fetch}
+        
+        for future in as_completed(future_to_state):
+            state = future_to_state[future]
             try:
-
-                print(f"Fetching {code}...")
-
-                data = fred.get_series(code, observation_start=START_DATE, observation_end=END_DATE)
-
-                if not data.empty:
-
-                    all_data[code] = data
-
-                    print(f"✓ {code}: {len(data)} observations")
-
-                else:
-
-                    print(f"✗ {code}: No data")
-
+                state_abbrev, state_data = future.result()
+                all_state_data.update(state_data)
             except Exception as e:
-
-                print(f"✗ {code}: Failed - {str(e)}")
-
+                print(f"Error fetching data for {state}: {e}")
     
-
-    if all_data.empty:
-
+    # Fetch national variables
+    print("Fetching national variables...")
+    national_data = {}
+    for domain, codes in national_variables.items():
+        for code in codes:
+            data = fetch_series_with_retry(code, start_date, end_date)
+            if not data.empty:
+                national_data[code] = data
+                print(f"✓ {code}: {len(data)} observations")
+            else:
+                print(f"✗ {code}: No data")
+    
+    # Combine all data
+    all_data = {**all_state_data, **national_data}
+    
+    if not all_data:
         raise ValueError("No macro data could be fetched!")
-
     
-
+    # Convert to DataFrame
+    combined_df = pd.DataFrame(all_data)
+    
     # Convert to quarterly (standard quarterly end dates)
-
-    quarterly_data = all_data.resample('Q').last()
-
+    # Ensure index is datetime before resample
+    combined_df.index = pd.to_datetime(combined_df.index)
+    quarterly_data = combined_df.resample('Q').last()
     
-
     # Save raw data
-
     quarterly_data.to_csv(RAW_MACRO_FILE)
-
     print(f"Saved {quarterly_data.shape[0]} quarterly observations with {quarterly_data.shape[1]} variables")
-
     
-
     return quarterly_data
 
-
-
-class MacroSurvivalProcessor:
-
+class StateMacroSurvivalProcessor:
     def __init__(self, raw_file):
-
         self.raw_file = raw_file
-
         self.macro_data = None
-
         self.scalers = {}
-
         self.pca_models = {}
-
+        self.state_data = {}  # Store processed data by state
         
-
     def load_and_process(self):
-
-        """Load and process macro data - NO NULL VALUES GUARANTEED"""
-
-        print("Loading and processing macro data...")
-
+        """Load and process state-level macro data"""
+        print("Loading and processing state-level macro data...")
         
-
         # Load raw data
-
         raw_data = pd.read_csv(self.raw_file, index_col=0, parse_dates=True)
-
         print(f"Raw data shape: {raw_data.shape}")
-
         
-
-        # Step 1: Clean data - remove columns with >20% missing
-
+        # Step 1: Clean data - remove columns with >50% missing (more lenient for state data)
         missing_pct = raw_data.isnull().sum() / len(raw_data)
-
-        good_cols = missing_pct[missing_pct <= 0.20].index.tolist()
-
+        good_cols = missing_pct[missing_pct <= 0.50].index.tolist()
         clean_data = raw_data[good_cols].copy()
-
         print(f"After removing high-missing columns: {clean_data.shape}")
-
         
-
-        # Step 2: Fill missing values systematically
-
-        clean_data = self._fill_missing_values(clean_data)
-
+        # Step 2: Separate state and national data
+        state_cols = [col for col in clean_data.columns if any(col.startswith(state + '_') for state in STATE_ABBREVIATIONS.values())]
+        national_cols = [col for col in clean_data.columns if col not in state_cols]
         
-
-        # Step 3: Create transformations
-
-        transformed_data = self._create_transformations(clean_data)
-
+        print(f"State columns: {len(state_cols)}")
+        print(f"National columns: {len(national_cols)}")
         
-
-        # Step 4: Apply PCA by domain
-
-        pca_features = self._apply_domain_pca(transformed_data)
-
+        # Step 3: Process national data
+        national_processed = self._process_national_data(clean_data[national_cols])
         
-
-        # Step 5: Create economic indicators
-
-        final_data = self._create_indicators(pca_features)
-
+        # Step 4: Process state data
+        state_processed = self._process_state_data(clean_data[state_cols])
         
-
-        # Step 6: Final cleanup - ENSURE NO NULLS
-
+        # Step 5: Combine processed data
+        final_data = pd.concat([national_processed, state_processed], axis=1)
+        
+        # Step 6: Final cleanup
         final_data = self._final_cleanup(final_data)
-
         
-
         self.macro_data = final_data
-
         print(f"Final macro data shape: {final_data.shape}")
-
         print(f"Null values: {final_data.isnull().sum().sum()}")
-
         
-
         return final_data
-
     
-
-    def _fill_missing_values(self, df):
-
-        """Fill missing values - NO NULLS ALLOWED"""
-
-        print("Filling missing values...")
-
+    def _process_national_data(self, df):
+        """Process national-level variables"""
+        print("Processing national variables...")
         
-
-        filled_df = df.copy()
-
+        # Fill missing values
+        filled_df = self._fill_missing_values(df)
         
-
-        for col in filled_df.columns:
-
-            series = filled_df[col]
-
-            
-
-            # Forward fill (up to 2 quarters)
-
-            filled_df[col] = series.fillna(method='ffill', limit=2)
-
-            
-
-            # Backward fill (up to 2 quarters)
-
-            filled_df[col] = filled_df[col].fillna(method='bfill', limit=2)
-
-            
-
-            # Linear interpolation for remaining gaps
-
-            filled_df[col] = filled_df[col].interpolate(method='linear')
-
-            
-
-            # Final fallback: median imputation
-
-            if filled_df[col].isnull().any():
-
-                median_val = filled_df[col].median()
-
-                filled_df[col] = filled_df[col].fillna(median_val)
-
-        
-
-        return filled_df
-
-    
-
-    def _create_transformations(self, df):
-
-        """Create economic transformations"""
-
-        print("Creating transformations...")
-
-        
-
+        # Create transformations
         trans_data = pd.DataFrame(index=df.index)
-
         
-
         # Keep key levels
-
-        level_vars = ['UNRATE', 'FEDFUNDS', 'GS10', 'GS2', 'CFNAI', 'NFCI', 'VIXCLS', 'UMCSENT']
-
+        level_vars = ['FEDFUNDS', 'GS10', 'GS2', 'NFCI', 'VIXCLS', 'UMCSENT']
         for var in level_vars:
-
-            if var in df.columns:
-
-                trans_data[var] = df[var]
-
+            if var in filled_df.columns:
+                trans_data[var] = filled_df[var]
         
-
-        # Create growth rates (4-quarter)
-
-        growth_vars = ['GDPC1', 'INDPRO', 'PAYEMS', 'HOUST']
-
-        for var in growth_vars:
-
-            if var in df.columns:
-
-                growth = df[var].pct_change(periods=4) * 100
-
-                trans_data[f'{var}_growth'] = growth
-
-        
-
-        # Create inflation rates (4-quarter)
-
-        inflation_vars = ['CPIAUCSL', 'CPILFESL', 'PCEPI', 'CSUSHPISA']
-
-        for var in inflation_vars:
-
-            if var in df.columns:
-
-                inflation = df[var].pct_change(periods=4) * 100
-
-                trans_data[f'{var}_inflation'] = inflation
-
-        
-
-        # Create returns (1-quarter)
-
-        return_vars = ['SP500']
-
-        for var in return_vars:
-
-            if var in df.columns:
-
-                returns = df[var].pct_change(periods=1) * 100
-
-                trans_data[f'{var}_return'] = returns
-
-        
-
         # Create spreads
-
-        if 'GS10' in df.columns and 'GS2' in df.columns:
-
-            trans_data['yield_spread_10_2'] = df['GS10'] - df['GS2']
-
+        if 'GS10' in filled_df.columns and 'GS2' in filled_df.columns:
+            trans_data['yield_spread_10_2'] = filled_df['GS10'] - filled_df['GS2']
         
-
-        if 'DBAA' in df.columns and 'DAAA' in df.columns:
-
-            trans_data['credit_spread'] = df['DBAA'] - df['DAAA']
-
+        if 'DBAA' in filled_df.columns and 'DAAA' in filled_df.columns:
+            trans_data['credit_spread'] = filled_df['DBAA'] - filled_df['DAAA']
         
-
-        if 'MORTGAGE30US' in df.columns and 'GS10' in df.columns:
-
-            trans_data['mortgage_spread'] = df['MORTGAGE30US'] - df['GS10']
-
+        # Create inflation rates
+        inflation_vars = ['CPIAUCSL', 'CPILFESL', 'PCEPI']
+        for var in inflation_vars:
+            if var in filled_df.columns:
+                inflation = filled_df[var].pct_change(periods=4) * 100
+                trans_data[f'{var}_inflation'] = inflation
         
-
-        # Fill any new nulls from transformations
-
+        # Create returns
+        if 'SP500' in filled_df.columns:
+            trans_data['SP500_return'] = filled_df['SP500'].pct_change(periods=1) * 100
+        
+        # Fill any new nulls
         for col in trans_data.columns:
-
             if trans_data[col].isnull().any():
-
-                # Use forward/backward fill
-
-                trans_data[col] = trans_data[col].fillna(method='ffill').fillna(method='bfill')
-
-                # Final fallback
-
-                if trans_data[col].isnull().any():
-
-                    trans_data[col] = trans_data[col].fillna(0)
-
+                trans_data[col] = trans_data[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
         
-
         return trans_data
-
     
-
-    def _apply_domain_pca(self, df):
-
-        """Apply domain-specific PCA"""
-
-        print("Applying domain PCA...")
-
+    def _process_state_data(self, df):
+        """Process state-level variables with state-specific PCA"""
+        print("Processing state variables...")
         
-
-        # Define domain mappings for transformed variables
-
-        domain_map = {
-
-            'rates': ['FEDFUNDS', 'GS10', 'GS2', 'yield_spread_10_2'],
-
-            'credit': ['DBAA', 'DAAA', 'credit_spread', 'mortgage_spread'],
-
-            'employment': ['UNRATE', 'PAYEMS_growth', 'ICSA'],
-
-            'inflation': ['CPIAUCSL_inflation', 'CPILFESL_inflation', 'PCEPI_inflation'],
-
-            'activity': ['GDPC1_growth', 'INDPRO_growth', 'CFNAI'],
-
-            'housing': ['HOUST_growth', 'CSUSHPISA_inflation'],
-
-            'stress': ['NFCI', 'VIXCLS', 'TEDRATE'],
-
-            'sentiment': ['UMCSENT', 'SP500_return']
-
-        }
-
+        # Fill missing values
+        filled_df = self._fill_missing_values(df)
         
-
-        pca_data = pd.DataFrame(index=df.index)
-
+        # Group by state
+        states = list(STATE_ABBREVIATIONS.values())
+        all_state_processed = pd.DataFrame(index=df.index)
         
-
-        for domain, vars_list in domain_map.items():
-
-            # Find available variables
-
-            available_vars = [v for v in vars_list if v in df.columns]
-
+        for state in states:
+            state_cols = [col for col in filled_df.columns if col.startswith(f'{state}_')]
             
-
-            if len(available_vars) < 2:
-
-                print(f"Skipping {domain} - insufficient variables")
-
+            if len(state_cols) < 2:
                 continue
-
             
-
-            # Get domain data
-
-            domain_df = df[available_vars].copy()
-
+            state_df = filled_df[state_cols].copy()
             
-
-            # Remove zero variance columns
-
-            domain_df = domain_df.loc[:, domain_df.var() != 0]
-
+            # Create state-specific transformations
+            state_processed = self._create_state_transformations(state_df, state)
             
-
-            if domain_df.shape[1] < 2:
-
-                print(f"Skipping {domain} - insufficient variance")
-
-                continue
-
+            # Apply PCA to state data
+            state_pca = self._apply_state_pca(state_processed, state)
             
-
-            # Standardize
-
-            scaler = StandardScaler()
-
-            scaled_data = scaler.fit_transform(domain_df)
-
-            
-
-            # Apply PCA (2 components max)
-
-            n_components = min(2, domain_df.shape[1])
-
-            pca = PCA(n_components=n_components)
-
-            pca_result = pca.fit_transform(scaled_data)
-
-            
-
-            # Store results
-
-            for i in range(n_components):
-
-                pca_data[f'{domain}_PC{i+1}'] = pca_result[:, i]
-
-            
-
-            # Store models
-
-            self.scalers[domain] = scaler
-
-            self.pca_models[domain] = pca
-
-            
-
-            print(f"{domain}: {len(available_vars)} vars -> {n_components} PCs "
-
-                  f"(var explained: {pca.explained_variance_ratio_.sum():.2f})")
-
+            # Add to combined data
+            all_state_processed = pd.concat([all_state_processed, state_pca], axis=1)
         
-
-        # Add key original variables
-
-        key_vars = ['UNRATE', 'FEDFUNDS', 'GS10', 'CFNAI', 'NFCI', 'yield_spread_10_2']
-
-        for var in key_vars:
-
-            if var in df.columns:
-
-                pca_data[var] = df[var]
-
-        
-
-        return pca_data
-
+        return all_state_processed
     
-
-    def _create_indicators(self, df):
-
-        """Create economic indicators"""
-
-        print("Creating economic indicators...")
-
+    def _create_state_transformations(self, state_df, state):
+        """Create transformations for a specific state"""
+        trans_data = pd.DataFrame(index=state_df.index)
         
-
-        indicator_data = df.copy()
-
+        # Map variable types for this state
+        for col in state_df.columns:
+            base_name = col.replace(f'{state}_', '')
+            
+            # Keep levels for certain variables
+            if base_name in ['unemployment_rate', 'coincident_index']:
+                trans_data[col] = state_df[col]
+            
+            # Create growth rates for economic activity
+            elif base_name in ['nonfarm_payrolls', 'labor_force', 'total_wages', 'gdp', 'housing_permits']:
+                growth = state_df[col].pct_change(periods=4) * 100
+                trans_data[f'{col}_growth'] = growth
+            
+            # Create inflation for price indices
+            elif base_name in ['house_price_index', 'per_capita_income']:
+                inflation = state_df[col].pct_change(periods=4) * 100
+                trans_data[f'{col}_inflation'] = inflation
+            
+            else:
+                # Default: keep as level
+                trans_data[col] = state_df[col]
         
-
-        # Economic regimes (convert to numeric instead of categorical)
-
-        if 'UNRATE' in df.columns:
-
-            # Create numerical regime indicators
-
-            indicator_data['unemployment_regime_low'] = (df['UNRATE'] <= 4).astype(int)
-
-            indicator_data['unemployment_regime_normal'] = ((df['UNRATE'] > 4) & (df['UNRATE'] <= 6)).astype(int)
-
-            indicator_data['unemployment_regime_high'] = ((df['UNRATE'] > 6) & (df['UNRATE'] <= 8)).astype(int)
-
-            indicator_data['unemployment_regime_crisis'] = (df['UNRATE'] > 8).astype(int)
-
+        # Fill nulls from transformations
+        for col in trans_data.columns:
+            if trans_data[col].isnull().any():
+                trans_data[col] = trans_data[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
         
-
-        if 'FEDFUNDS' in df.columns:
-
-            # Create numerical regime indicators
-
-            indicator_data['interest_rate_regime_zero'] = (df['FEDFUNDS'] <= 1).astype(int)
-
-            indicator_data['interest_rate_regime_low'] = ((df['FEDFUNDS'] > 1) & (df['FEDFUNDS'] <= 3)).astype(int)
-
-            indicator_data['interest_rate_regime_normal'] = ((df['FEDFUNDS'] > 3) & (df['FEDFUNDS'] <= 6)).astype(int)
-
-            indicator_data['interest_rate_regime_high'] = (df['FEDFUNDS'] > 6).astype(int)
-
-        
-
-        if 'yield_spread_10_2' in df.columns:
-
-            # Create numerical regime indicators
-
-            indicator_data['yield_curve_regime_inverted'] = (df['yield_spread_10_2'] < 0).astype(int)
-
-            indicator_data['yield_curve_regime_flat'] = ((df['yield_spread_10_2'] >= 0) & (df['yield_spread_10_2'] <= 1)).astype(int)
-
-            indicator_data['yield_curve_regime_normal'] = ((df['yield_spread_10_2'] > 1) & (df['yield_spread_10_2'] <= 2)).astype(int)
-
-            indicator_data['yield_curve_regime_steep'] = (df['yield_spread_10_2'] > 2).astype(int)
-
-        
-
-        # Economic stress composite
-
-        stress_components = []
-
-        if 'NFCI' in df.columns:
-
-            stress_components.append((df['NFCI'] > 0).astype(int))
-
-        if 'UNRATE' in df.columns:
-
-            stress_components.append((df['UNRATE'] > df['UNRATE'].median()).astype(int))
-
-        if 'VIXCLS' in df.columns:
-
-            stress_components.append((df['VIXCLS'] > df['VIXCLS'].quantile(0.75)).astype(int))
-
-        
-
-        if stress_components:
-
-            indicator_data['economic_stress_composite'] = sum(stress_components) / len(stress_components)
-
-        
-
-        # Credit conditions (convert to numeric)
-
-        if 'credit_spread' in df.columns:
-
-            indicator_data['credit_conditions_good'] = (df['credit_spread'] <= df['credit_spread'].quantile(0.33)).astype(int)
-
-            indicator_data['credit_conditions_moderate'] = ((df['credit_spread'] > df['credit_spread'].quantile(0.33)) & 
-
-                                                          (df['credit_spread'] <= df['credit_spread'].quantile(0.67))).astype(int)
-
-            indicator_data['credit_conditions_stressed'] = (df['credit_spread'] > df['credit_spread'].quantile(0.67)).astype(int)
-
-        
-
-        # Yield curve inversion duration
-
-        if 'yield_spread_10_2' in df.columns:
-
-            indicator_data['yield_curve_inversion_duration'] = (
-
-                df['yield_spread_10_2'] < 0
-
-            ).astype(int).rolling(4, min_periods=1).sum()
-
-        
-
-        return indicator_data
-
+        return trans_data
     
-
-    def _final_cleanup(self, df):
-
-        """Final cleanup - GUARANTEE NO NULLS"""
-
-        print("Final cleanup...")
-
+    def _apply_state_pca(self, state_df, state):
+        """Apply PCA to state-specific data"""
+        if state_df.shape[1] < 2:
+            return state_df
         
-
-        clean_df = df.copy()
-
-        
-
-        # Handle numeric variables only (no categorical)
-
-        numeric_cols = clean_df.select_dtypes(include=[np.number]).columns
-
-        for col in numeric_cols:
-
-            if clean_df[col].isnull().any():
-
-                # Use median for final imputation
-
-                median_val = clean_df[col].median()
-
-                clean_df[col] = clean_df[col].fillna(median_val)
-
-        
-
         # Remove zero variance columns
-
-        for col in numeric_cols:
-
-            if clean_df[col].var() == 0:
-
-                clean_df = clean_df.drop(columns=[col])
-
-                print(f"Removed zero variance column: {col}")
-
+        state_df = state_df.loc[:, state_df.var() != 0]
         
-
-        # Final null check
-
-        null_count = clean_df.isnull().sum().sum()
-
-        if null_count > 0:
-
-            print(f"WARNING: {null_count} nulls remaining - applying final imputation")
-
+        if state_df.shape[1] < 2:
+            return state_df
+        
+        # Standardize
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(state_df)
+        
+        # Apply PCA (max 3 components for state data)
+        n_components = min(3, state_df.shape[1])
+        pca = PCA(n_components=n_components)
+        pca_result = pca.fit_transform(scaled_data)
+        
+        # Create result DataFrame
+        pca_data = pd.DataFrame(index=state_df.index)
+        
+        for i in range(n_components):
+            pca_data[f'{state}_PC{i+1}'] = pca_result[:, i]
+        
+        # Store models
+        self.scalers[state] = scaler
+        self.pca_models[state] = pca
+        
+        # Add key original variables
+        key_vars = [f'{state}_unemployment_rate', f'{state}_coincident_index']
+        for var in key_vars:
+            if var in state_df.columns:
+                pca_data[var] = state_df[var]
+        
+        print(f"{state}: {state_df.shape[1]} vars -> {n_components} PCs "
+              f"(var explained: {pca.explained_variance_ratio_.sum():.2f})")
+        
+        return pca_data
+    
+    def _fill_missing_values(self, df):
+        """Fill missing values - more aggressive for state data"""
+        print(f"Filling missing values for {df.shape[1]} variables...")
+        
+        filled_df = df.copy()
+        
+        for col in filled_df.columns:
+            series = filled_df[col]
             
-
-            # Final aggressive imputation
-
+            # Forward fill (up to 4 quarters for state data)
+            filled_df[col] = series.fillna(method='ffill', limit=4)
+            
+            # Backward fill (up to 4 quarters)
+            filled_df[col] = filled_df[col].fillna(method='bfill', limit=4)
+            
+            # Linear interpolation
+            filled_df[col] = filled_df[col].interpolate(method='linear')
+            
+            # Final fallback: median imputation
+            if filled_df[col].isnull().any():
+                median_val = filled_df[col].median()
+                if pd.isna(median_val):
+                    # If median is also null, use 0
+                    filled_df[col] = filled_df[col].fillna(0)
+                else:
+                    filled_df[col] = filled_df[col].fillna(median_val)
+        
+        return filled_df
+    
+    def _final_cleanup(self, df):
+        """Final cleanup - GUARANTEE NO NULLS"""
+        print("Final cleanup...")
+        
+        clean_df = df.copy()
+        
+        # Handle numeric variables only
+        numeric_cols = clean_df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if clean_df[col].isnull().any():
+                median_val = clean_df[col].median()
+                if pd.isna(median_val):
+                    clean_df[col] = clean_df[col].fillna(0)
+                else:
+                    clean_df[col] = clean_df[col].fillna(median_val)
+        
+        # Remove zero variance columns
+        for col in numeric_cols:
+            if clean_df[col].var() == 0:
+                clean_df = clean_df.drop(columns=[col])
+                print(f"Removed zero variance column: {col}")
+        
+        # Final null check
+        null_count = clean_df.isnull().sum().sum()
+        if null_count > 0:
+            print(f"WARNING: {null_count} nulls remaining - applying final imputation")
             imputer = SimpleImputer(strategy='median')
-
             numeric_cols = clean_df.select_dtypes(include=[np.number]).columns
-
             if len(numeric_cols) > 0:
-
                 clean_df[numeric_cols] = imputer.fit_transform(clean_df[numeric_cols])
-
         
-
         return clean_df
-
     
-
     def map_to_quarter(self, date):
-
-        """Map date to standard quarter end - MODIFIED FOR STANDARD QUARTERLY MAPPING"""
-
+        """Map date to standard quarter end"""
         if pd.isna(date):
-
             return None
-
         
-
         dt = pd.to_datetime(date)
-
         year = dt.year
-
         quarter = dt.quarter
-
         
-
-        # Standard quarterly mapping - map to actual quarter end
-
         if quarter == 1:
-
             return pd.Timestamp(f'{year}-03-31')
-
         elif quarter == 2:
-
             return pd.Timestamp(f'{year}-06-30')
-
         elif quarter == 3:
-
             return pd.Timestamp(f'{year}-09-30')
-
-        else:  # quarter == 4
-
+        else:
             return pd.Timestamp(f'{year}-12-31')
-
     
-
     def _fix_data_types_for_parquet(self, df):
-
         """Fix data types before saving to Parquet"""
-
         print("Fixing data types for Parquet compatibility...")
-
         
-
         fixed_df = df.copy()
-
         protected_cols = [
-        'quarter', 'macro_quarter',
-        'PURPOSE', 'STATE', 'PROP', 'OCC_STAT', 
-        'FIRST_FLAG', 'CHANNEL', 'ifrs9_stage', 
-        'credit_score_bucket', 'ltv_bucket'
+            'quarter', 'macro_quarter', 'STATE',
+            'PURPOSE', 'PROP', 'OCC_STAT', 
+            'FIRST_FLAG', 'CHANNEL', 'ifrs9_stage', 
+            'credit_score_bucket', 'ltv_bucket'
         ]
-
         
-
-        # Convert object columns to appropriate types
-
         for col in fixed_df.columns:
-
             if col in protected_cols:
-
-                continue  
-
+                continue
             if fixed_df[col].dtype == 'object':
-
-                # Try to convert to datetime first
-
-                if 'DATE' in col.upper() or 'DT' in col.upper():
-
-                    try:
-
-                        fixed_df[col] = pd.to_datetime(fixed_df[col], errors='coerce')
-
-                        print(f"Converted {col} to datetime")
-
-                    except:
-
-                        # If datetime conversion fails, convert to string
-
-                        fixed_df[col] = fixed_df[col].astype(str)
-
-                        print(f"Converted {col} to string")
-
-                else:
-
-                    # For non-date object columns, try to convert to numeric
-
-                    try:
-
-                        fixed_df[col] = pd.to_numeric(fixed_df[col], errors='coerce')
-
-                        # Fill any nulls created by conversion
-
-                        if fixed_df[col].isnull().any():
-
-                            fixed_df[col] = fixed_df[col].fillna(0)
-
-                        print(f"Converted {col} to numeric")
-
-                    except:
-
-                        # If numeric conversion fails, keep as string
-
-                        fixed_df[col] = fixed_df[col].astype(str)
-
-                        print(f"Converted {col} to string")
-
+                try:
+                    fixed_df[col] = pd.to_numeric(fixed_df[col], errors='coerce')
+                    if fixed_df[col].isnull().any():
+                        fixed_df[col] = fixed_df[col].fillna(0)
+                except:
+                    fixed_df[col] = fixed_df[col].astype(str)
         
-
-        # Handle any remaining nulls
-
+        # Handle remaining nulls
         for col in fixed_df.columns:
-
             if fixed_df[col].isnull().any():
-
                 if fixed_df[col].dtype in ['float64', 'int64']:
-
                     fixed_df[col] = fixed_df[col].fillna(0)
-
                 elif fixed_df[col].dtype == 'object':
-
                     fixed_df[col] = fixed_df[col].fillna('unknown')
-
                 else:
-
-                    # For datetime columns
-
                     fixed_df[col] = fixed_df[col].fillna(pd.Timestamp('1900-01-01'))
-
         
-
         return fixed_df
-
     
-
     def integrate_with_survival(self, survival_df):
-
-        """Integrate with survival data - NO NULLS GUARANTEED"""
-
-        print("Integrating with survival data...")
-
-
+        """Integrate with survival data using state-specific macro conditions"""
+        print("Integrating with survival data using state-level macro data...")
 
         if self.macro_data is None:
+            raise ValueError("Must process macro data first! Call load_and_process() first.")
 
-            raise ValueError("Must process macro data first!")
-
-
-
-        # Preserve 'quarter' if present
-
+        # Preserve original columns
         if 'quarter' in survival_df.columns:
-
             original_quarter = survival_df['quarter'].copy()
-
         else:
-
             original_quarter = None
 
-
-
-        # Map origination dates to macro quarters using standard quarterly mapping
-
+        # Map origination dates to macro quarters
         survival_df['macro_quarter'] = survival_df['ORIG_DATE'].apply(self.map_to_quarter)
+        
+        # Get state abbreviations for survival data
+        if 'STATE' in survival_df.columns:
+            # Map state names to abbreviations if needed
+            survival_df['state_abbrev'] = survival_df['STATE'].map(
+                lambda x: STATE_ABBREVIATIONS.get(x, x) if x in STATE_ABBREVIATIONS else x
+            )
+        else:
+            print("WARNING: No STATE column found in survival data. Using national averages only.")
+            survival_df['state_abbrev'] = 'NATIONAL'
 
-
-
-        # Merge with macro data
-
-        merged = survival_df.merge(
-
-            self.macro_data,
-
-            left_on='macro_quarter',
-
-            right_index=True,
-
-            how='left'
-
-        )
-
-
-
+        # Create state-specific macro features
+        merged_data = []
+        
+        for state in survival_df['state_abbrev'].unique():
+            if pd.isna(state):
+                continue
+                
+            state_mask = survival_df['state_abbrev'] == state
+            state_survival = survival_df[state_mask].copy()
+            
+            # Get relevant macro columns for this state
+            if state != 'NATIONAL':
+                state_macro_cols = [col for col in self.macro_data.columns 
+                                  if col.startswith(f'{state}_') or not any(col.startswith(f'{s}_') 
+                                  for s in STATE_ABBREVIATIONS.values())]
+            else:
+                # Use national variables only
+                state_macro_cols = [col for col in self.macro_data.columns 
+                                  if not any(col.startswith(f'{s}_') for s in STATE_ABBREVIATIONS.values())]
+            
+            # Select relevant macro data
+            relevant_macro = self.macro_data[state_macro_cols]
+            
+            # Merge with state survival data
+            state_merged = state_survival.merge(
+                relevant_macro,
+                left_on='macro_quarter',
+                right_index=True,
+                how='left'
+            )
+            
+            merged_data.append(state_merged)
+        
+        # Combine all states
+        merged = pd.concat(merged_data, ignore_index=True)
+        
         # Re-attach quarter column if it existed
-
         if original_quarter is not None:
-
-            merged['quarter'] = original_quarter
-
+            # Need to ensure the index aligns or re-index appropriately
+            # If survival_df was already indexed, this might need more robust handling
+            merged['quarter'] = original_quarter.reindex(survival_df.index).loc[merged.index]
         
-
-        # Handle missing macro data for out-of-range dates
-
-        macro_cols = [col for col in merged.columns if col not in survival_df.columns]
-
+        # Handle missing macro data
+        macro_cols = [col for col in merged.columns if col not in survival_df.columns and '_PC' in col or any(v in col for v in ['unemployment_rate', 'coincident_index', 'yield_spread', 'credit_spread', 'inflation', 'return', 'WAGES', 'gdp', 'LF', 'BPPRIVSA', 'PCPI', 'HPI', 'NA', 'UR', 'PHCI', 'GS', 'FEDFUNDS', 'DBAA', 'DAAA', 'BAMLH0A0HYM2', 'CPIAUCSL', 'CPILFESL', 'PCEPI', 'NFCI', 'VIXCLS', 'TEDRATE', 'UMCSENT', 'SP500'])]
         macro_start = self.macro_data.index.min()
-
         macro_end = self.macro_data.index.max()
-
         
-
         for col in macro_cols:
-
             if merged[col].isnull().any():
-
                 # For dates before macro start, use first available values
-
                 before_mask = merged['macro_quarter'] < macro_start
-
-                if before_mask.any():
-
+                if before_mask.any() and col in self.macro_data.columns:
                     first_val = self.macro_data[col].iloc[0]
-
                     merged.loc[before_mask, col] = first_val
-
                 
-
                 # For dates after macro end, use last available values
-
                 after_mask = merged['macro_quarter'] > macro_end
-
-                if after_mask.any():
-
+                if after_mask.any() and col in self.macro_data.columns:
                     last_val = self.macro_data[col].iloc[-1]
-
                     merged.loc[after_mask, col] = last_val
-
                 
-
-                # For any remaining nulls, use median
-
+                # For remaining nulls, use median or 0
                 if merged[col].isnull().any():
-
-                    median_val = self.macro_data[col].median()
-
-                    merged[col] = merged[col].fillna(median_val)
-
-        
-
-        # Fix data types for Parquet compatibility
-
-        merged = self._fix_data_types_for_parquet(merged)
-
-        
-
-        # Final null check
-
-        null_count = merged.isnull().sum().sum()
-
-        print(f"Integration complete. Shape: {merged.shape}")
-
-        print(f"Null values: {null_count}")
-
-        
-
-        if null_count > 0:
-
-            print("WARNING: Nulls found after integration - applying final cleanup")
-
-            for col in merged.columns:
-
-                if merged[col].isnull().any():
-
-                    if merged[col].dtype in ['float64', 'int64']:
-
-                        merged[col] = merged[col].fillna(0)
-
-                    elif merged[col].dtype == 'object':
-
-                        merged[col] = merged[col].fillna('unknown')
-
+                    if col in self.macro_data.columns:
+                        median_val = self.macro_data[col].median()
+                        merged[col] = merged[col].fillna(median_val if not pd.isna(median_val) else 0)
                     else:
-
+                        merged[col] = merged[col].fillna(0)
+        
+        # Fix data types
+        merged = self._fix_data_types_for_parquet(merged)
+        
+        # Final cleanup
+        null_count = merged.isnull().sum().sum()
+        print(f"Integration complete. Shape: {merged.shape}")
+        print(f"Null values: {null_count}")
+        
+        if null_count > 0:
+            print("WARNING: Applying final null cleanup")
+            for col in merged.columns:
+                if merged[col].isnull().any():
+                    if merged[col].dtype in ['float64', 'int64']:
+                        merged[col] = merged[col].fillna(0)
+                    elif merged[col].dtype == 'object':
+                        merged[col] = merged[col].fillna('unknown')
+                    else:
                         merged[col] = merged[col].fillna(pd.Timestamp('1900-01-01'))
-
         
-
         return merged
-
     
-
     def get_summary(self):
-
         """Get processing summary"""
-
         if self.macro_data is None:
-
             return "No processed data available"
-
         
-
+        # Count features by type
+        state_features = len([c for c in self.macro_data.columns if any(c.startswith(f'{s}_') for s in STATE_ABBREVIATIONS.values())])
+        national_features = len(self.macro_data.columns) - state_features
+        pca_features = len([c for c in self.macro_data.columns if '_PC' in c])
+        
         summary = {
-
             'total_features': len(self.macro_data.columns),
-
+            'state_features': state_features,
+            'national_features': national_features,
+            'pca_features': pca_features,
             'observations': len(self.macro_data),
-
             'date_range': f"{self.macro_data.index.min()} to {self.macro_data.index.max()}",
-
             'null_values': self.macro_data.isnull().sum().sum(),
-
-            'pca_domains': len(self.pca_models),
-
-            'feature_types': {
-
-                'pca_features': len([c for c in self.macro_data.columns if '_PC' in c]),
-
-                'level_vars': len([c for c in self.macro_data.columns if c in ['UNRATE', 'FEDFUNDS', 'GS10', 'CFNAI', 'NFCI']]),
-
-                'spreads': len([c for c in self.macro_data.columns if 'spread' in c]),
-
-                'indicators': len([c for c in self.macro_data.columns if any(x in c for x in ['regime', 'composite', 'conditions', 'duration'])])
-
-            }
-
+            'states_with_pca': len(self.pca_models),
         }
-
         
-
         return summary
 
-
-
 # Main execution
-
 if __name__ == "__main__":
-
-    # Fetch fresh data (uncomment if needed)
-
-    # fetch_macro_data()
-
+    # Load survival data first to determine date range
+    print("\n=== LOADING SURVIVAL DATA TO DETERMINE DATE RANGE ===")
+    survival_df = pd.read_parquet('/Users/sundargodina/Downloads/survival_files/survival_all.parquet')
     
+    if 'ORIG_DATE' not in survival_df.columns:
+        raise ValueError("survival_df must contain an 'ORIG_DATE' column for dynamic date range determination.")
+    
+    # Ensure ORIG_DATE is datetime
+    survival_df['ORIG_DATE'] = pd.to_datetime(survival_df['ORIG_DATE'])
+    
+    # Calculate min and max origination dates
+    min_orig_date = survival_df['ORIG_DATE'].min()
+    max_orig_date = survival_df['ORIG_DATE'].max()
+    
+    # Determine effective start date for macro data
+    # Need at least 4 quarters of lookback for pct_change(periods=4)
+    # Adding a buffer to be safe, e.g., 1 year prior to the earliest origination
+    effective_start_date = (min_orig_date - pd.DateOffset(years=1)).strftime('%Y-%m-%d')
+    effective_end_date = max_orig_date.strftime('%Y-%m-%d')
+    
+    print(f"Determined Macro Fetch Start Date: {effective_start_date}")
+    print(f"Determined Macro Fetch End Date: {effective_end_date}")
 
+    # Fetch fresh state-level data using dynamic dates
+    macro_data = fetch_macro_data_by_state(effective_start_date, effective_end_date)
+    
     # Initialize processor
-
-    processor = MacroSurvivalProcessor(RAW_MACRO_FILE)
-
+    processor = StateMacroSurvivalProcessor(RAW_MACRO_FILE)
     
 
     # Process macro data
-
-    macro_data = processor.load_and_process()
-
+    processed_macro_data = processor.load_and_process() # This will load the data saved by fetch_macro_data_by_state
     
-
     # Get summary
-
     summary = processor.get_summary()
-
     print("\n=== PROCESSING SUMMARY ===")
-
     for key, value in summary.items():
-
         print(f"{key}: {value}")
-
     
-
-    # Load survival data
-
-    print("\n=== LOADING SURVIVAL DATA ===")
-
-    survival_df = pd.read_parquet('/Users/sundargodina/Downloads/survival_files/survival_all.parquet')
-
-    
-
-    # Integrate
-
-    final_df = processor.integrate_with_survival(survival_df)
-
-    
-
-    # Save result
-
-    output_file = '/Users/sundargodina/Downloads/fred/survival_with_macro_no_nulls.parquet'
-
-    final_df.to_parquet(output_file)
-
-    
-
-    print(f"\n=== FINAL RESULT ===")
-
-    print(f"File saved: {output_file}")
-
-    print(f"Final shape: {final_df.shape}")
-
-    print(f"Null values: {final_df.isnull().sum().sum()}")
-
-    print(f"Macro columns added: {len([c for c in final_df.columns if c not in survival_df.columns])}")
-
-    
-
-    # Show sample of features
-
-    macro_cols = [col for col in final_df.columns if col not in survival_df.columns]
-
-    print(f"\nSample macro features:")
-
-    print(final_df[macro_cols[:10]].head())
-
-    
-
-    # Show data types
-
-    print(f"\nData types summary:")
-
-    print(final_df.dtypes.value_counts())
-
-    
-
-    # Variance check
-
-    print(f"\nFeature variance check:")
-
-    for col in macro_cols[:10]:
-
-        if final_df[col].dtype in ['float64', 'int64']:
-
-            print(f"{col}: variance = {final_df[col].var():.4f}")
