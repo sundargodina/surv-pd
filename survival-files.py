@@ -302,3 +302,230 @@ process_quarter_optimized("/Users/sundargodina/Downloads/project/2021Q1.parquet"
 process_quarter_optimized("/Users/sundargodina/Downloads/project/2021Q3.parquet", "2021Q3")
 process_quarter_optimized("/Users/sundargodina/Downloads/project/2022Q1.parquet", "2022Q1")
 process_quarter_optimized("/Users/sundargodina/Downloads/project/2022Q3.parquet", "2022Q3")
+
+
+#code for file with static covariates
+import polars as pl
+import os
+import gc
+from typing import List
+
+def get_memory_usage():
+    """Get current memory usage"""
+    import psutil
+    process = psutil.Process()
+    return process.memory_info().rss / (1024**3)
+
+def process_single_file_static(
+    input_file: str, 
+    output_file: str = "master_static_covariates.parquet"
+):
+    """
+    Process a single file and append to master static file
+    
+    Args:
+        input_file: Path to quarterly parquet file
+        output_file: Master output file to append to
+    """
+    
+    static_covariates = [
+        "LOAN_ID", "ORIG_DATE", "FIRST_PAY", "CSCORE_B", "CSCORE_C", "DTI",
+        "NUM_BO", "ORIG_RATE", "ORIG_UPB", "ORIG_TERM", "OLTV", "OCLTV",
+        "MI_PCT", "PURPOSE", "STATE", "MSA", "ZIP", "PROP", "OCC_STAT",
+        "NO_UNITS", "PRODUCT", "CHANNEL", "FIRST_FLAG", "SELLER", "SERVICER"
+    ]
+    
+    if not os.path.exists(input_file):
+        print(f" File not found: {input_file}")
+        return False
+    
+    file_size_mb = os.path.getsize(input_file) / (1024**2)
+    print(f"\n Processing: {os.path.basename(input_file)} ({file_size_mb:.1f} MB)")
+    print(f"Memory before: {get_memory_usage():.1f} GB")
+    
+    try:
+        # Extract static data from this file
+        print("   📖 Reading and extracting static data...")
+        
+        if file_size_mb > 500:  # Large file - use streaming if possible
+            print("  Large file detected - using careful processing")
+            try:
+                # Try lazy processing first
+                static_data = (pl.scan_parquet(input_file)
+                             .select(static_covariates)
+                             .unique(subset=["LOAN_ID"], keep="first")
+                             .collect())
+            except Exception as e:
+                print(f  Lazy processing failed: {e}")
+                print("  Falling back to direct read...")
+                # Fallback: read file directly but only select needed columns
+                static_data = (pl.read_parquet(input_file, columns=static_covariates)
+                             .unique(subset=["LOAN_ID"], keep="first"))
+        else:
+            # Smaller file - direct processing
+            static_data = (pl.scan_parquet(input_file)
+                         .select(static_covariates)
+                         .unique(subset=["LOAN_ID"], keep="first")
+                         .collect())
+        
+        print(f"  Extracted {len(static_data):,} unique loans")
+        print(f" Memory after extraction: {get_memory_usage():.1f} GB")
+        
+        # Append to master file
+        if os.path.exists(output_file):
+            print("  Appending to existing master file...")
+            
+            # Read existing data
+            existing_data = pl.scan_parquet(output_file)
+            
+            # Combine and deduplicate (keep first occurrence)
+            combined = pl.concat([existing_data, static_data.lazy()])
+            final_data = combined.unique(subset=["LOAN_ID"], keep="first").collect()
+            
+            print(f" Combined dataset: {len(final_data):,} unique loans")
+            
+        else:
+            print(" Creating new master file...")
+            final_data = static_data
+        
+        # Write back to master file
+        print("Writing to master file...")
+        final_data.write_parquet(output_file, compression="zstd", compression_level=3)
+        
+        # Clean up memory
+        del static_data, final_data
+        if 'existing_data' in locals():
+            del existing_data
+        if 'combined' in locals():
+            del combined
+        gc.collect()
+        
+        print(f" Complete! Memory after cleanup: {get_memory_usage():.1f} GB")
+        return True
+        
+    except Exception as e:
+        print(f" Error processing {input_file}: {e}")
+        gc.collect()  # Clean up on error
+        return False
+
+def process_all_files_one_by_one(
+    input_files: List[str],
+    output_file: str = "master_static_covariates.parquet"
+):
+    """
+    Process all files one by one, building master file incrementally
+    """
+    print("Starting one-by-one processing...")
+    print(f"Target files: {len(input_files)}")
+    print(f" Output: {output_file}")
+    
+    # Remove existing master file to start fresh
+    if os.path.exists(output_file):
+        print(f" Removing existing {output_file}")
+        os.remove(output_file)
+    
+    successful = 0
+    failed = 0
+    
+    for i, file_path in enumerate(input_files, 1):
+        print(f"\n{'='*60}")
+        print(f"📋 File {i}/{len(input_files)}")
+        
+        success = process_single_file_static(file_path, output_file)
+        
+        if success:
+            successful += 1
+            print(f" Success! ({successful}/{i} files completed)")
+        else:
+            failed += 1
+            print(f"  Failed! ({failed} files failed so far)")
+        
+        # Show progress
+        if os.path.exists(output_file):
+            current_stats = pl.scan_parquet(output_file).select([
+                pl.len().alias("total_records"),
+                pl.col("LOAN_ID").n_unique().alias("unique_loans")
+            ]).collect()
+            
+            total_records = current_stats["total_records"][0]
+            unique_loans = current_stats["unique_loans"][0]
+            
+            print(f" Master file now has: {unique_loans:,} unique loans ({total_records:,} total records)")
+        
+        # Memory cleanup between files
+        gc.collect()
+    
+    print(f"\n{'='*60}")
+    print(" PROCESSING COMPLETE!")
+    print(f" Successful: {successful}/{len(input_files)} files")
+    print(f" Failed: {failed}/{len(input_files)} files")
+    
+    if os.path.exists(output_file):
+        final_stats = pl.scan_parquet(output_file).select([
+            pl.len().alias("total_records"),
+            pl.col("LOAN_ID").n_unique().alias("unique_loans")
+        ]).collect()
+        
+        total_final = final_stats["total_records"][0]
+        unique_final = final_stats["unique_loans"][0]
+        duplicates = total_final - unique_final
+        
+        print(f"FINAL RESULTS:")
+        print(f"   Unique loans: {unique_final:,}")
+        print(f"   Total records: {total_final:,}")
+        print(f"  Duplicates removed: {duplicates:,}")
+        
+        file_size_mb = os.path.getsize(output_file) / (1024**2)
+        print(f" File size: {file_size_mb:.1f} MB")
+
+def quick_file_check(input_files: List[str]):
+    """
+    Quick check of all files before processing
+    """
+    print("🔍 Checking files before processing...")
+    
+    valid_files = []
+    total_size = 0
+    
+    for file_path in input_files:
+        if os.path.exists(file_path):
+            size_mb = os.path.getsize(file_path) / (1024**2)
+            total_size += size_mb
+            valid_files.append(file_path)
+            print(f"  {os.path.basename(file_path)}: {size_mb:.1f} MB")
+        else:
+            print(f"   {file_path}: NOT FOUND")
+    
+    print(f"\n📊 Summary:")
+    print(f"   Valid files: {len(valid_files)}/{len(input_files)}")
+    print(f"   Total size: {total_size:.1f} MB ({total_size/1024:.1f} GB)")
+    
+    return valid_files
+
+# Your file list
+quarterly_files = [
+    "/Users/sundargodina/Downloads/project/2017Q1.parquet",
+    "/Users/sundargodina/Downloads/project/2017Q3.parquet",
+    "/Users/sundargodina/Downloads/project/2018Q1.parquet", 
+    "/Users/sundargodina/Downloads/project/2018Q3.parquet",
+    "/Users/sundargodina/Downloads/project/2019Q1.parquet",
+    "/Users/sundargodina/Downloads/project/2019Q3.parquet",
+    "/Users/sundargodina/Downloads/project/2020Q1.parquet",
+    "/Users/sundargodina/Downloads/project/2020Q3.parquet",
+    "/Users/sundargodina/Downloads/project/2021Q1.parquet",
+    "/Users/sundargodina/Downloads/project/2021Q3.parquet", 
+    "/Users/sundargodina/Downloads/project/2022Q1.parquet",
+    "/Users/sundargodina/Downloads/project/2022Q3.parquet"
+]
+
+# Check files first
+print("=" * 60)
+valid_files = quick_file_check(quarterly_files)
+
+if valid_files:
+    print(f"\n Ready to process {len(valid_files)} files")
+    print("Run: process_all_files_one_by_one(valid_files)")
+else:
+    print(" No valid files found!")
+    
+process_all_files_one_by_one(valid_files)
