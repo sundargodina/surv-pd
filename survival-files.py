@@ -529,3 +529,13 @@ else:
     print(" No valid files found!")
     
 process_all_files_one_by_one(valid_files)
+
+
+
+result = (
+    time
+    .join(static, on="LOAN_ID", how="left")
+    .collect(streaming=True)
+)
+
+#result is the combined data, with static and time varying covariates
