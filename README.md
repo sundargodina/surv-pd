@@ -1,2 +1,5 @@
-repo for time to default modelling, using data from fannie mae loan dataset, which is a dataset of mortgage loans, integrated macro economic time series from FRED Database.
-used cox proportional hazards for the modelling.
+Time-to-default modelling with Cox Hazards model
+
+- Uses Fannie Mae loan data + FRED macro data  
+- Cox model with different ways of adding macros (PCA, domain PCA, lag-aware PCA)  
+- Evaluated with C-index, Brier score, Kaplan-Meier curves  
